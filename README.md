@@ -1,4 +1,4 @@
-# profmig
+# windows-profile-migration
 
 > **Status: early development.** Only the read-only phases exist and they
 > have not yet been validated on real Windows machines. Test on a disposable
@@ -17,12 +17,12 @@ only writes are the log file and, for `backup`, a new backup folder.
 Run from an elevated terminal (Administrator or SYSTEM):
 
 ```text
-profmig preflight         --source .\jdoe --target CORP\jdoe
-profmig migrate --dry-run --source .\jdoe --target CORP\jdoe
-profmig backup            --source .\jdoe --target CORP\jdoe [--backup-dir D:\pm]
+windows-profile-migration preflight         --source .\jdoe --target CORP\jdoe
+windows-profile-migration migrate --dry-run --source .\jdoe --target CORP\jdoe
+windows-profile-migration backup            --source .\jdoe --target CORP\jdoe [--backup-dir D:\pm]
 
 # Domain A -> B when the old domain no longer resolves:
-profmig preflight --source S-1-5-21-...-1105 --target NEWCORP\jdoe --accept SOURCE_ACCOUNT
+windows-profile-migration preflight --source S-1-5-21-...-1105 --target NEWCORP\jdoe --accept SOURCE_ACCOUNT
 ```
 
 Accounts must be qualified (`PC01\user`, `.\user`, `DOMAIN\user`,
@@ -37,7 +37,8 @@ local account before the domain one.
 | 3 | runtime error |
 
 Logs are JSONL, one record per action, finding and skipped item, written
-to `--log-dir`, else `%PROFMIG_HOME%\logs`, else `%ProgramData%\profmig\logs`.
+to `--log-dir`, else `%WINDOWS_PROFILE_MIGRATION_HOME%\logs`, else
+`%ProgramData%\windows-profile-migration\logs`.
 Backups go to a new folder whose DACL admits only SYSTEM and Administrators,
 because it contains copies of the user's hives.
 
@@ -93,7 +94,7 @@ block (overridable with `--accept OS_SUPPORTED`).
 ## Validation on a VM
 
 ```powershell
-.\scripts\vm-validate.ps1 -Profmig .\profmig.exe -TargetAccount CORP\pmtarget
+.\scripts\vm-validate.ps1 -WindowsProfileMigration .\windows-profile-migration.exe -TargetAccount CORP\pmtarget
 ```
 
 The script creates a throwaway local user and profile, then asserts the

@@ -728,13 +728,13 @@ fn check_migration_marker(facts: &SystemFacts) -> Finding {
         Finding::new(
             ids::MIGRATION_MARKER,
             Severity::Pass,
-            "no interrupted profmig migration found",
+            "no interrupted windows-profile-migration migration found",
         )
     } else {
         Finding::new(
             ids::MIGRATION_MARKER,
             Severity::Blocking,
-            "a previous profmig migration did not complete; roll back before retrying",
+            "a previous windows-profile-migration migration did not complete; roll back before retrying",
         )
         .with_details(marked)
     }
@@ -784,7 +784,9 @@ fn check_loaded_hives(facts: &SystemFacts) -> Finding {
     }
     for key in &facts.loaded_hives {
         if key.to_ascii_lowercase().starts_with(HIVE_MOUNT_PREFIX) {
-            loaded.push(format!("HKU\\{key} (left over by an earlier profmig run)"));
+            loaded.push(format!(
+                "HKU\\{key} (left over by an earlier windows-profile-migration run)"
+            ));
         }
     }
     if loaded.is_empty() {
@@ -1525,9 +1527,11 @@ mod tests {
     }
 
     #[test]
-    fn leftover_profmig_mount_is_blocked() {
+    fn leftover_windows_profile_migration_mount_is_blocked() {
         let mut facts = clean_facts();
-        facts.loaded_hives.push("profmig_ntuser".into());
+        facts
+            .loaded_hives
+            .push("windows-profile-migration_ntuser".into());
         assert_eq!(severity_of(&facts, ids::HIVES_UNLOADED), Severity::Blocking);
     }
 

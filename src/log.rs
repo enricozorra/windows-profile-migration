@@ -32,12 +32,14 @@ pub struct Logger {
 }
 
 impl Logger {
-    /// Creates `<dir>/profmig-<UTC timestamp>-<command>.jsonl`. Refuses to
+    /// Creates `<dir>/windows-profile-migration-<UTC timestamp>-<command>.jsonl`. Refuses to
     /// append to an existing file so each run has its own log.
     pub fn create(dir: &Path, command: &str) -> io::Result<Logger> {
         fs::create_dir_all(dir)?;
         let run_id = format!("{}-{}", timefmt::now().compact(), std::process::id());
-        let path = dir.join(format!("profmig-{run_id}-{command}.jsonl"));
+        let path = dir.join(format!(
+            "windows-profile-migration-{run_id}-{command}.jsonl"
+        ));
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -85,7 +87,10 @@ mod tests {
 
     #[test]
     fn writes_one_json_object_per_line() {
-        let dir = std::env::temp_dir().join(format!("profmig-log-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "windows-profile-migration-log-test-{}",
+            std::process::id()
+        ));
         let mut log = Logger::create(&dir, "test").unwrap();
         log.event(Level::Info, "preflight", "a", "first", vec![])
             .unwrap();

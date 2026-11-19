@@ -96,7 +96,7 @@ pub fn create(
     )?;
 
     let manifest = Json::obj(vec![
-        ("tool", "profmig".into()),
+        ("tool", "windows-profile-migration".into()),
         ("version", env!("CARGO_PKG_VERSION").into()),
         ("run", log.run_id().into()),
         ("created", timefmt::now().rfc3339().into()),

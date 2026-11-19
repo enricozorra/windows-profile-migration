@@ -1,5 +1,5 @@
 [package]
-name = "profmig"
+name = "windows-profile-migration"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
@@ -9,7 +9,7 @@ repository = "https://github.com/enricozorra/windows-profile-migration"
 publish = false
 
 [[bin]]
-name = "profmig"
+name = "windows-profile-migration"
 path = "src/main.rs"
 
 # Win32 bindings only. windows-sys is raw FFI with no runtime, which keeps the

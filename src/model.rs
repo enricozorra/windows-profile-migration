@@ -14,9 +14,9 @@ pub const APPX_USER_STORE_KEY: &str =
 
 /// Value the execution phase writes into ProfileList\<TargetSID> before any
 /// other change. Its presence anywhere means a previous run did not finish.
-pub const MIGRATION_MARKER_VALUE: &str = "ProfMigSourceSid";
+pub const MIGRATION_MARKER_VALUE: &str = "WindowsProfileMigrationSourceSid";
 /// Prefix of the temporary HKU mount names the execution phase will use.
-pub const HIVE_MOUNT_PREFIX: &str = "profmig_";
+pub const HIVE_MOUNT_PREFIX: &str = "windows-profile-migration_";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenInfo {

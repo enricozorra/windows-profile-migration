@@ -243,7 +243,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let dir = std::env::temp_dir().join(format!(
-                "profmig-test-{name}-{}-{nanos}",
+                "windows-profile-migration-test-{name}-{}-{nanos}",
                 std::process::id()
             ));
             fs::create_dir_all(&dir).unwrap();

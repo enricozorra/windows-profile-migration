@@ -25,7 +25,7 @@ mod unsupported {
     };
     use crate::scan::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT};
 
-    const MESSAGE: &str = "profmig only runs on Windows";
+    const MESSAGE: &str = "windows-profile-migration only runs on Windows";
 
     fn unsupported() -> io::Error {
         io::Error::new(io::ErrorKind::Unsupported, MESSAGE)

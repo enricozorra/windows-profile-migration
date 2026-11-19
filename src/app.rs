@@ -31,7 +31,7 @@ pub fn run(args: &Args) -> Result<i32, Box<dyn Error>> {
         Level::Info,
         "run",
         "run_started",
-        "profmig started",
+        "windows-profile-migration started",
         vec![
             ("version", env!("CARGO_PKG_VERSION").into()),
             ("command", args.command.name().into()),
@@ -54,7 +54,7 @@ pub fn run(args: &Args) -> Result<i32, Box<dyn Error>> {
             Level::Info,
             "run",
             "run_finished",
-            "profmig finished",
+            "windows-profile-migration finished",
             vec![("exit_code", Json::Int(i64::from(*code)))],
         )?,
         Err(err) => log.event(
@@ -161,16 +161,16 @@ fn run_logged(args: &Args, log: &mut Logger) -> Result<i32, Box<dyn Error>> {
     }
 }
 
-/// `%PROFMIG_HOME%` if set, else `%ProgramData%\profmig`. Environment-driven
+/// `%WINDOWS_PROFILE_MIGRATION_HOME%` if set, else `%ProgramData%\windows-profile-migration`. Environment-driven
 /// so fleets can redirect logs and backups (e.g. to a data volume).
 fn base_dir() -> Result<PathBuf, Box<dyn Error>> {
-    if let Some(home) = env::var_os("PROFMIG_HOME") {
+    if let Some(home) = env::var_os("WINDOWS_PROFILE_MIGRATION_HOME") {
         return Ok(PathBuf::from(home));
     }
     match env::var_os("ProgramData") {
-        Some(data) => Ok(PathBuf::from(data).join("profmig")),
+        Some(data) => Ok(PathBuf::from(data).join("windows-profile-migration")),
         None => {
-            Err("neither PROFMIG_HOME nor ProgramData is set; pass --log-dir/--backup-dir".into())
+            Err("neither WINDOWS_PROFILE_MIGRATION_HOME nor ProgramData is set; pass --log-dir/--backup-dir".into())
         }
     }
 }

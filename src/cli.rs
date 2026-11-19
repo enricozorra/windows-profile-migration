@@ -5,10 +5,11 @@ use std::path::PathBuf;
 
 use crate::preflight::OVERRIDABLE_CHECKS;
 
-pub const USAGE: &str = r#"profmig - re-map a Windows user profile to a new account SID
+pub const USAGE: &str = r#"windows-profile-migration - re-map a Windows user profile to a new account SID
 
 USAGE:
-    profmig <COMMAND> --source <ACCOUNT> --target <ACCOUNT> [OPTIONS]
+    windows-profile-migration <COMMAND> --source <ACCOUNT> --target <ACCOUNT>
+                              [OPTIONS]
 
 COMMANDS:
     preflight          Run read-only checks and print a pass/fail report
@@ -25,8 +26,8 @@ OPTIONS:
     --profile-path <PATH>  Assert where the source profile lives; mismatch blocks
     --accept <CHECK>       Downgrade an overridable blocking check to a warning
                            (repeatable): OS_SUPPORTED, SOURCE_ACCOUNT, EFS_FILES
-    --log-dir <DIR>        Log folder (default: %PROFMIG_HOME%\logs, else
-                           %ProgramData%\profmig\logs)
+    --log-dir <DIR>        Log folder. Default: %WINDOWS_PROFILE_MIGRATION_HOME%\logs,
+                           else %ProgramData%\windows-profile-migration\logs
     --backup-dir <DIR>     Backup folder for `backup` (default: ...\backups)
     -h, --help             Show this help
     -V, --version          Show the version

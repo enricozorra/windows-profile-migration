@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-    End-to-end validation of profmig's read-only phases on a disposable VM.
+    End-to-end validation of windows-profile-migration's read-only phases on a disposable VM.
 
 .DESCRIPTION
-    Creates a throwaway local user with a real profile, runs profmig against
+    Creates a throwaway local user with a real profile, runs windows-profile-migration against
     it in known-good and known-bad states, and asserts exit codes and
     findings. It also proves the read-only guarantee: ProfileList and the
     test user's NTUSER.DAT must be byte-identical before and after every
@@ -13,8 +13,8 @@
     PowerShell 5.1 or PowerShell 7. The script creates and deletes a local
     account and temporarily adds/removes a ProfileList .bak key.
 
-.PARAMETER Profmig
-    Path to profmig.exe.
+.PARAMETER WindowsProfileMigration
+    Path to windows-profile-migration.exe.
 
 .PARAMETER TargetAccount
     Optional DOMAIN\user that has never logged on to this VM. When given
@@ -22,13 +22,13 @@
     validated too. Without it, only the blocking cases run.
 
 .EXAMPLE
-    .\vm-validate.ps1 -Profmig C:\tools\profmig.exe -TargetAccount CORP\pmtarget
+    .\vm-validate.ps1 -WindowsProfileMigration C:\tools\windows-profile-migration.exe -TargetAccount CORP\pmtarget
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory)] [string] $Profmig,
+    [Parameter(Mandatory)] [string] $WindowsProfileMigration,
     [string] $TargetAccount,
-    [string] $WorkDir = (Join-Path $env:TEMP "profmig-validate-$(Get-Date -Format yyyyMMddHHmmss)")
+    [string] $WorkDir = (Join-Path $env:TEMP "windows-profile-migration-validate-$(Get-Date -Format yyyyMMddHHmmss)")
 )
 
 Set-StrictMode -Version Latest
@@ -53,10 +53,10 @@ function Write-Result([string] $Name, [bool] $Passed, [string] $Detail = '') {
     }
 }
 
-function Invoke-Profmig([string[]] $Arguments) {
+function Invoke-WindowsProfileMigration([string[]] $Arguments) {
     $logDir = Join-Path $WorkDir 'logs'
     $all = $Arguments + @('--log-dir', $logDir)
-    $output = & $Profmig @all 2>&1 | Out-String
+    $output = & $WindowsProfileMigration @all 2>&1 | Out-String
     [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
 }
 
@@ -74,20 +74,20 @@ function Get-StateFingerprint([string] $NtUserPath) {
 function New-ProfileForUser([string] $Sid) {
     # userenv!CreateProfile builds C:\Users\<name> and the ProfileList entry
     # without an interactive logon.
-    if (-not ('ProfmigValidate.UserEnv' -as [type])) {
-        Add-Type -Namespace ProfmigValidate -Name UserEnv -MemberDefinition @'
+    if (-not ('WindowsProfileMigrationValidate.UserEnv' -as [type])) {
+        Add-Type -Namespace WindowsProfileMigrationValidate -Name UserEnv -MemberDefinition @'
 [DllImport("userenv.dll", CharSet = CharSet.Unicode, SetLastError = true)]
 public static extern int CreateProfile(string pszUserSid, string pszUserName, System.Text.StringBuilder pszProfilePath, uint cchProfilePath);
 '@
     }
     $path = New-Object System.Text.StringBuilder 260
-    $hr = [ProfmigValidate.UserEnv]::CreateProfile($Sid, $script:TestUser, $path, 260)
+    $hr = [WindowsProfileMigrationValidate.UserEnv]::CreateProfile($Sid, $script:TestUser, $path, 260)
     if ($hr -ne 0) { throw ('CreateProfile failed: 0x{0:X8}' -f $hr) }
     $path.ToString()
 }
 
 Assert-Admin
-if (-not (Test-Path -LiteralPath $Profmig)) { throw "profmig not found at $Profmig" }
+if (-not (Test-Path -LiteralPath $WindowsProfileMigration)) { throw "windows-profile-migration not found at $WindowsProfileMigration" }
 New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
 
 $script:TestUser = 'pmtest' + (Get-Random -Minimum 1000 -Maximum 9999)
@@ -96,7 +96,7 @@ $user = $null
 $bakKey = $null
 
 try {
-    $user = New-LocalUser -Name $script:TestUser -Password $password -Description 'profmig validation (temporary)'
+    $user = New-LocalUser -Name $script:TestUser -Password $password -Description 'windows-profile-migration validation (temporary)'
     $sid = $user.SID.Value
     $profilePath = New-ProfileForUser $sid
     $ntuser = Join-Path $profilePath 'NTUSER.DAT'
@@ -106,25 +106,25 @@ try {
     $baseline = Get-StateFingerprint $ntuser
 
     # --- usage errors -----------------------------------------------------
-    $r = Invoke-Profmig @('migrate', '--source', $source, '--target', 'X\y')
+    $r = Invoke-WindowsProfileMigration @('migrate', '--source', $source, '--target', 'X\y')
     Write-Result 'migrate without --dry-run is refused (exit 2)' ($r.ExitCode -eq 2) $r.Output
 
     # --- ambiguous target -------------------------------------------------
-    $r = Invoke-Profmig @('preflight', '--source', $source, '--target', $script:TestUser)
+    $r = Invoke-WindowsProfileMigration @('preflight', '--source', $source, '--target', $script:TestUser)
     Write-Result 'bare target name blocks' (($r.ExitCode -eq 1) -and ($r.Output -match '\[BLOCK\]\s+TARGET_ACCOUNT')) $r.Output
 
     # --- local target -----------------------------------------------------
-    $r = Invoke-Profmig @('preflight', '--source', $source, '--target', "$env:COMPUTERNAME\Administrator")
+    $r = Invoke-WindowsProfileMigration @('preflight', '--source', $source, '--target', "$env:COMPUTERNAME\Administrator")
     Write-Result 'local target blocks' (($r.ExitCode -eq 1) -and ($r.Output -match '\[BLOCK\]\s+TARGET_ACCOUNT')) $r.Output
 
     # --- source given as SID resolves to the same profile ----------------
-    $r = Invoke-Profmig @('preflight', '--source', $sid, '--target', 'X\y')
+    $r = Invoke-WindowsProfileMigration @('preflight', '--source', $sid, '--target', 'X\y')
     Write-Result 'source by SID passes SOURCE_ACCOUNT' ($r.Output -match '\[PASS\s*\]\s+SOURCE_ACCOUNT') $r.Output
 
     # --- locked hive ------------------------------------------------------
     & "$env:SystemRoot\System32\reg.exe" load 'HKU\pmvalidate_lock' $ntuser | Out-Null
     try {
-        $r = Invoke-Profmig @('preflight', '--source', $source, '--target', 'X\y')
+        $r = Invoke-WindowsProfileMigration @('preflight', '--source', $source, '--target', 'X\y')
         Write-Result 'loaded hive blocks HIVE_FILES' ($r.Output -match '\[BLOCK\]\s+HIVE_FILES') $r.Output
     } finally {
         [gc]::Collect()
@@ -136,7 +136,7 @@ try {
     # --- .bak twin --------------------------------------------------------
     $bakKey = Join-Path $ProfileListKey "$sid.bak"
     New-Item -Path $bakKey -Force | Out-Null
-    $r = Invoke-Profmig @('preflight', '--source', $source, '--target', 'X\y')
+    $r = Invoke-WindowsProfileMigration @('preflight', '--source', $source, '--target', 'X\y')
     Write-Result '.bak entry blocks PROFILE_LIST_BAK' ($r.Output -match '\[BLOCK\]\s+PROFILE_LIST_BAK') $r.Output
     Remove-Item -Path $bakKey -Force
     $bakKey = $null
@@ -144,16 +144,16 @@ try {
 
     # --- passing path (needs a domain target) ----------------------------
     if ($TargetAccount) {
-        $r = Invoke-Profmig @('preflight', '--source', $source, '--target', $TargetAccount)
+        $r = Invoke-WindowsProfileMigration @('preflight', '--source', $source, '--target', $TargetAccount)
         Write-Result 'clean preflight passes (exit 0)' ($r.ExitCode -eq 0) $r.Output
 
-        $r = Invoke-Profmig @('migrate', '--dry-run', '--source', $source, '--target', $TargetAccount)
+        $r = Invoke-WindowsProfileMigration @('migrate', '--dry-run', '--source', $source, '--target', $TargetAccount)
         Write-Result 'dry-run prints a plan' (($r.ExitCode -eq 0) -and ($r.Output -match 'DRY RUN')) $r.Output
 
         Write-Result 'preflight and dry-run changed nothing' ((Get-StateFingerprint $ntuser) -eq $baseline)
 
         $backupRoot = Join-Path $WorkDir 'backups'
-        $r = Invoke-Profmig @('backup', '--source', $source, '--target', $TargetAccount, '--backup-dir', $backupRoot)
+        $r = Invoke-WindowsProfileMigration @('backup', '--source', $source, '--target', $TargetAccount, '--backup-dir', $backupRoot)
         Write-Result 'backup succeeds (exit 0)' ($r.ExitCode -eq 0) $r.Output
         $folder = Get-ChildItem -LiteralPath $backupRoot -Directory | Select-Object -First 1
         if ($folder) {
@@ -169,7 +169,7 @@ try {
         Write-Result 'backup changed nothing in the profile' ((Get-StateFingerprint $ntuser) -eq $baseline)
     } else {
         Write-Host '[SKIP] passing path, dry-run and backup: no -TargetAccount given' -ForegroundColor Yellow
-        $r = Invoke-Profmig @('migrate', '--dry-run', '--source', $source, '--target', 'X\y')
+        $r = Invoke-WindowsProfileMigration @('migrate', '--dry-run', '--source', $source, '--target', 'X\y')
         Write-Result 'blocked dry-run still exits 1' ($r.ExitCode -eq 1) $r.Output
         Write-Result 'preflight and dry-run changed nothing' ((Get-StateFingerprint $ntuser) -eq $baseline)
     }

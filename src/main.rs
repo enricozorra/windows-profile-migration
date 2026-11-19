@@ -1,4 +1,5 @@
-//! profmig: in-place Windows profile re-mapping (Local -> AD, Domain A -> B).
+//! windows-profile-migration: in-place Windows profile re-mapping
+//! (Local -> AD, Domain A -> B).
 //!
 //! This build implements the read-only phases: preflight, backup, and
 //! dry-run planning. No command mutates the profile or the registry.
@@ -43,7 +44,7 @@ fn main() {
             exit(app::EXIT_OK);
         }
         cli::Parsed::Version => {
-            println!("profmig {}", env!("CARGO_PKG_VERSION"));
+            println!("windows-profile-migration {}", env!("CARGO_PKG_VERSION"));
             exit(app::EXIT_OK);
         }
         cli::Parsed::Run(args) => args,
