@@ -56,6 +56,10 @@ function Write-Result([string] $Name, [bool] $Passed, [string] $Detail = '') {
 function Invoke-WindowsProfileMigration([string[]] $Arguments) {
     $logDir = Join-Path $WorkDir 'logs'
     $all = $Arguments + @('--log-dir', $logDir)
+    # Windows PowerShell 5.1 turns redirected native stderr into error
+    # records, which 'Stop' would make terminating; the exit code is what
+    # the checks assert on.
+    $ErrorActionPreference = 'Continue'
     $output = & $WindowsProfileMigration @all 2>&1 | Out-String
     [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
 }
