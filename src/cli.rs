@@ -17,7 +17,11 @@ COMMANDS:
     preflight          Run read-only checks and print a pass/fail report
     backup             Run preflight, then snapshot ProfileList, hives and ACLs
     migrate --dry-run  Run preflight and print the changes a migration would make
-                       (execution without --dry-run is not implemented yet)
+    migrate --stage-only
+                       Run preflight, then build the working copy next to the
+                       target folder and verify it against the source. Nothing
+                       else changes; `rollback` removes the copy. (The rest of
+                       the migration is not implemented yet.)
     status             Show every recorded migration, what it left on the system,
                        and leftovers that belong to no migration
     rollback           Undo an unfinished migration; only what its journal lists
@@ -53,6 +57,7 @@ pub enum Command {
     Preflight,
     Backup,
     MigrateDryRun,
+    MigrateStage,
     Status,
     Rollback,
 }
@@ -63,6 +68,7 @@ impl Command {
             Command::Preflight => "preflight",
             Command::Backup => "backup",
             Command::MigrateDryRun => "migrate-dry-run",
+            Command::MigrateStage => "migrate-stage",
             Command::Status => "status",
             Command::Rollback => "rollback",
         }
@@ -72,7 +78,7 @@ impl Command {
     pub fn needs_accounts(self) -> bool {
         matches!(
             self,
-            Command::Preflight | Command::Backup | Command::MigrateDryRun
+            Command::Preflight | Command::Backup | Command::MigrateDryRun | Command::MigrateStage
         )
     }
 }
@@ -119,6 +125,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, UsageErr
     let mut args = args.into_iter();
     let mut command_word: Option<String> = None;
     let mut dry_run = false;
+    let mut stage_only = false;
     let mut source = None;
     let mut target = None;
     let mut profile_path = None;
@@ -143,6 +150,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, UsageErr
             "-h" | "--help" => return Ok(Parsed::Help),
             "-V" | "--version" => return Ok(Parsed::Version),
             "--dry-run" => dry_run = true,
+            "--stage-only" => stage_only = true,
             "--discard-target-changes" => discard_target_changes = true,
             "--migration" => set_once(&mut migration, value("--migration")?, "--migration")?,
             "--source" => set_once(&mut source, value("--source")?, "--source")?,
@@ -191,17 +199,20 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, UsageErr
         Some("backup") => Command::Backup,
         Some("status") => Command::Status,
         Some("rollback") => Command::Rollback,
-        Some("migrate") if dry_run => Command::MigrateDryRun,
-        Some("migrate") => {
-            return Err(usage(
-                "migrate requires --dry-run: destructive execution is not implemented yet",
-            ))
+        Some("migrate") if dry_run && stage_only => {
+            return Err(usage("--dry-run and --stage-only exclude each other"))
         }
+        Some("migrate") if dry_run => Command::MigrateDryRun,
+        Some("migrate") if stage_only => Command::MigrateStage,
+        Some("migrate") => return Err(usage(
+            "migrate requires --dry-run or --stage-only: the full migration is not implemented yet",
+        )),
         Some(other) => return Err(usage(format!("unknown command '{other}'"))),
         None => return Err(usage("missing command")),
     };
-    if dry_run && command != Command::MigrateDryRun {
-        return Err(usage("--dry-run only applies to migrate"));
+    if (dry_run || stage_only) && !matches!(command, Command::MigrateDryRun | Command::MigrateStage)
+    {
+        return Err(usage("--dry-run and --stage-only only apply to migrate"));
     }
     if backup_dir.is_some() && command != Command::Backup {
         return Err(usage("--backup-dir only applies to backup"));
@@ -272,10 +283,15 @@ mod tests {
     }
 
     #[test]
-    fn migrate_requires_dry_run() {
+    fn migrate_requires_dry_run_or_stage_only() {
         assert!(parse_str("migrate --source a\\b --target c\\d").is_err());
         let args = run_args(r"migrate --dry-run --source a\b --target c\d");
         assert_eq!(args.command, Command::MigrateDryRun);
+        let args = run_args(r"migrate --stage-only --source a\b --target c\d");
+        assert_eq!(args.command, Command::MigrateStage);
+        assert!(parse_str(r"migrate --stage-only --dry-run --source a\b --target c\d").is_err());
+        assert!(parse_str(r"migrate --stage-only").is_err());
+        assert!(parse_str(r"preflight --stage-only --source a\b --target c\d").is_err());
     }
 
     #[test]

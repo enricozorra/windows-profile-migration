@@ -106,6 +106,15 @@ impl JournalWriter {
         Ok(JournalWriter { file })
     }
 
+    /// Creates a new journal; fails if one already exists.
+    pub fn create(path: &Path) -> io::Result<JournalWriter> {
+        let file = OpenOptions::new()
+            .append(true)
+            .create_new(true)
+            .open(path)?;
+        Ok(JournalWriter { file })
+    }
+
     pub fn append(&mut self, event: &str, fields: &[(&str, &str)]) -> io::Result<()> {
         let now = timefmt::now().rfc3339();
         let mut line = render(event, &now, fields);

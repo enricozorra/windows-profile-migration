@@ -5,10 +5,11 @@ use std::io;
 use std::path::Path;
 use std::ptr::null_mut;
 
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW,
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1,
-    SE_FILE_OBJECT,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
@@ -25,11 +26,13 @@ use super::wide::{
 /// %ProgramData% subfolders otherwise inherit write access for Users.
 const PRIVATE_DIR_SDDL: &str = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
+const SDDL_PARTS: u32 =
+    OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+
 /// Owner, group and DACL of `path` as SDDL. The SACL is not requested: that
 /// needs SeSecurityPrivilege enabled and the tool never changes SACLs.
 pub fn read_sddl(path: &Path) -> io::Result<String> {
     let wide = path_to_wide_verbatim(path);
-    let info = OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
     // SAFETY: NUL-terminated path; we only request the self-relative
     // descriptor (freed by LocalBox), not the individual component pointers.
@@ -37,7 +40,7 @@ pub fn read_sddl(path: &Path) -> io::Result<String> {
         GetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
-            info,
+            SDDL_PARTS,
             null_mut(),
             null_mut(),
             null_mut(),
@@ -49,14 +52,42 @@ pub fn read_sddl(path: &Path) -> io::Result<String> {
         return Err(win32_error("GetNamedSecurityInfoW", code));
     }
     let _descriptor = LocalBox(descriptor);
+    descriptor_to_sddl(descriptor)
+}
 
+/// Owner, group and DACL of an open handle (which needs READ_CONTROL) as
+/// SDDL. Unlike `read_sddl` this sees a junction itself, not its target.
+pub fn handle_sddl(handle: HANDLE) -> io::Result<String> {
+    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: valid open handle; only the self-relative descriptor (freed
+    // by LocalBox) is requested.
+    let code = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            SDDL_PARTS,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if code != 0 {
+        return Err(win32_error("GetSecurityInfo", code));
+    }
+    let _descriptor = LocalBox(descriptor);
+    descriptor_to_sddl(descriptor)
+}
+
+fn descriptor_to_sddl(descriptor: PSECURITY_DESCRIPTOR) -> io::Result<String> {
     let mut text: *mut u16 = null_mut();
-    // SAFETY: `descriptor` is the valid descriptor returned above.
+    // SAFETY: the caller passes a valid descriptor it still owns.
     let ok = unsafe {
         ConvertSecurityDescriptorToStringSecurityDescriptorW(
             descriptor,
             SDDL_REVISION_1,
-            info,
+            SDDL_PARTS,
             &mut text,
             null_mut(),
         )

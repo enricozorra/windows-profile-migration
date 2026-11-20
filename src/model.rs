@@ -281,6 +281,35 @@ pub struct TargetDirFacts {
     pub staging_exists: bool,
 }
 
+/// One file system entry as the copy and its verification see it, read
+/// through a handle that does not follow reparse points.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EntryFacts {
+    /// Raw Win32 attributes.
+    pub attributes: u32,
+    /// FILETIME values (100 ns since 1601).
+    pub created: i64,
+    pub written: i64,
+    /// Length of the unnamed data stream.
+    pub size: u64,
+    /// The reparse data, for junctions, symlinks and other reparse points.
+    pub reparse: Option<Vec<u8>>,
+    /// Owner, group and DACL as SDDL.
+    pub security: String,
+    /// Alternate data streams as `name=size`, sorted; empty for links.
+    pub streams: Vec<String>,
+}
+
+/// The outcome of copying one entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopiedEntry {
+    /// The source, read through the same handle the copy read from.
+    pub source: EntryFacts,
+    /// SHA-256 of the data as it was copied. `None` for folders, links and
+    /// sparse files, whose data does not arrive as one plain stream.
+    pub sha256: Option<[u8; 32]>,
+}
+
 /// Registry data in a platform-neutral shape, as handed to the inspector.
 // Some variants are only constructed by the Windows platform layer.
 #[cfg_attr(not(windows), allow(dead_code))]

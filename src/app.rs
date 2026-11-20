@@ -16,6 +16,7 @@ use crate::preflight::{self, Options, Severity};
 use crate::recovery::RollbackOptions;
 use crate::report;
 use crate::rollback;
+use crate::stage;
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_BLOCKED: i32 = 1;
@@ -85,7 +86,7 @@ fn run_logged(args: &Args, log: &mut Logger) -> Result<i32, Box<dyn Error>> {
             };
             return rollback::run_rollback(&migrations_root, id, options, log);
         }
-        Command::Preflight | Command::Backup | Command::MigrateDryRun => {}
+        Command::Preflight | Command::Backup | Command::MigrateDryRun | Command::MigrateStage => {}
     }
     let (Some(source), Some(target)) = (&args.source, &args.target) else {
         return Err(format!("{} needs --source and --target", args.command.name()).into());
@@ -181,6 +182,13 @@ fn run_logged(args: &Args, log: &mut Logger) -> Result<i32, Box<dyn Error>> {
                 println!("    {name:<60} {bytes:>12} bytes");
             }
             Ok(EXIT_OK)
+        }
+        Command::MigrateStage => {
+            if report.is_blocked() {
+                println!("\nWorking copy refused: resolve the blocking findings first.");
+                return Ok(EXIT_BLOCKED);
+            }
+            stage::run_stage(&facts, &migrations_root, log)
         }
     }
 }

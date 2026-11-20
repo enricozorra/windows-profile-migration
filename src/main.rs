@@ -1,8 +1,9 @@
 //! windows-profile-migration: in-place Windows profile re-mapping
 //! (Local -> AD, Domain A -> B).
 //!
-//! This build implements the read-only phases: preflight, backup, and
-//! dry-run planning. No command mutates the profile or the registry.
+//! This build implements the read-only phases (preflight, backup, dry-run
+//! planning), the working copy (`migrate --stage-only`), and `status` and
+//! `rollback`. No command modifies the source profile or its registry entry.
 
 // Win32 FFI is confined to `win`, which opts back in with allow(unsafe_code).
 #![deny(unsafe_code)]
@@ -12,6 +13,7 @@ mod app;
 mod apps;
 mod backup;
 mod cli;
+mod copy;
 mod facts;
 mod hive_scan;
 mod journal;
@@ -25,11 +27,13 @@ mod preflight;
 mod profile_state;
 mod recovery;
 mod references;
+mod reparse;
 mod report;
 mod rollback;
 mod scan;
 mod sddl;
 mod sid;
+mod stage;
 mod timefmt;
 #[cfg(windows)]
 mod win;

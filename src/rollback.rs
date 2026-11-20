@@ -11,8 +11,8 @@ use std::time::UNIX_EPOCH;
 
 use crate::app::{EXIT_BLOCKED, EXIT_OK};
 use crate::journal::{
-    self, Artifact, ArtifactKind, JournalState, JournalWriter, FOLDER_MARKER_FILE, JOURNAL_FILE,
-    LOCK_FILE,
+    self, Artifact, ArtifactKind, ArtifactState, JournalState, JournalWriter, FOLDER_MARKER_FILE,
+    JOURNAL_FILE, LOCK_FILE,
 };
 use crate::json::Json;
 use crate::log::{Level, Logger};
@@ -215,9 +215,11 @@ fn execute(
     let result = match action {
         Action::UnloadHive(name) => platform::unload_hive(name),
         Action::DeleteProfileListEntry(sid) => platform::delete_profile_list_entry(sid),
-        // std's remove_dir_all deletes junctions and symlinks without
-        // following them, so nothing outside the folder can be reached.
-        Action::DeleteFolder(path) => fs::remove_dir_all(path),
+        // Links are deleted as links, never followed, so nothing outside
+        // the folder can be reached. std's remove_dir_all cannot be used:
+        // it lists folders without backup semantics, which the copied
+        // "deny list folder" ACE on legacy profile junctions refuses.
+        Action::DeleteFolder(path) => platform::delete_tree(path, FOLDER_MARKER_FILE),
     };
     match result {
         Ok(()) => {
@@ -343,7 +345,18 @@ fn observe(state: &JournalState, view: &SystemView) -> Observed {
 fn observe_artifact(state: &JournalState, artifact: &Artifact, view: &SystemView) -> Presence {
     match artifact.kind {
         ArtifactKind::StagingDir | ArtifactKind::TargetDir => {
-            folder_presence(Path::new(&artifact.value), &state.header.id)
+            let path = Path::new(&artifact.value);
+            match folder_presence(path, &state.header.id) {
+                // A crash between creating the folder and writing its
+                // marker leaves it empty and unmarked. Removing an empty
+                // folder this migration announced loses nothing.
+                Presence::Foreign(_)
+                    if artifact.state == ArtifactState::Intended && is_empty_folder(path) =>
+                {
+                    Presence::Ours
+                }
+                presence => presence,
+            }
         }
         ArtifactKind::ProfileListEntry => {
             let entry = view
@@ -402,6 +415,14 @@ pub fn folder_presence(path: &Path, id: &str) -> Presence {
         }
         Err(err) => Presence::Unknown(format!("reading its marker: {err}")),
     }
+}
+
+/// A real directory (not a junction) with no entries at all.
+fn is_empty_folder(path: &Path) -> bool {
+    let is_real_dir = fs::symlink_metadata(path).is_ok_and(|m| {
+        m.is_dir() && platform::file_attributes(&m) & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    });
+    is_real_dir && fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
 /// Whether the target's hive was written after the commit, i.e. the user
@@ -551,6 +572,38 @@ mod tests {
         let link = tmp.0.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(matches!(folder_presence(&link, "m1"), Presence::Foreign(_)));
+    }
+
+    #[test]
+    fn an_announced_empty_unmarked_folder_is_ours_but_not_a_created_one() {
+        let tmp = TempDir::new("empty");
+        let dir = tmp.0.join("copy");
+        fs::create_dir(&dir).unwrap();
+        let mut state = JournalState::default();
+        state.header.id = "m1".into();
+        let view = SystemView {
+            profile_list: ProfileListSnapshot::default(),
+            loaded_hives: vec![],
+        };
+        let mut artifact = Artifact {
+            kind: ArtifactKind::StagingDir,
+            value: dir.display().to_string(),
+            state: ArtifactState::Intended,
+        };
+        assert_eq!(observe_artifact(&state, &artifact, &view), Presence::Ours);
+
+        artifact.state = ArtifactState::Created;
+        assert!(matches!(
+            observe_artifact(&state, &artifact, &view),
+            Presence::Foreign(_)
+        ));
+
+        artifact.state = ArtifactState::Intended;
+        fs::write(dir.join("data.txt"), "x").unwrap();
+        assert!(matches!(
+            observe_artifact(&state, &artifact, &view),
+            Presence::Foreign(_)
+        ));
     }
 
     #[test]
