@@ -10,9 +10,10 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegEnumKeyExW, RegEnumValueW, RegLoadKeyW, RegOpenKeyExW, RegQueryValueExW,
-    RegUnLoadKeyW, HKEY, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ, KEY_WOW64_64KEY, REG_BINARY,
-    REG_DWORD, REG_EXPAND_SZ, REG_MULTI_SZ, REG_OPTION_OPEN_LINK, REG_SZ,
+    RegCloseKey, RegDeleteKeyExW, RegEnumKeyExW, RegEnumValueW, RegLoadKeyW, RegOpenKeyExW,
+    RegQueryValueExW, RegUnLoadKeyW, HKEY, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ,
+    KEY_WOW64_64KEY, REG_BINARY, REG_DWORD, REG_EXPAND_SZ, REG_MULTI_SZ, REG_OPTION_OPEN_LINK,
+    REG_SZ,
 };
 
 use super::account::binary_sid_to_string;
@@ -312,7 +313,7 @@ pub fn walk_hive_file(
         ))),
         Err(err) => Err(err),
     };
-    let unloaded = unload(&mount);
+    let unloaded = unload_hive(&mount);
     match (walked, unloaded) {
         (Ok(errors), Ok(())) => Ok(errors),
         (Ok(mut errors), Err(err)) => {
@@ -326,7 +327,11 @@ pub fn walk_hive_file(
     }
 }
 
-fn unload(mount: &str) -> io::Result<()> {
+/// Unmounts `HKU\<mount>`, retrying while another process briefly holds it.
+/// RegUnLoadKey needs the backup and restore privileges switched on.
+pub fn unload_hive(mount: &str) -> io::Result<()> {
+    enable_privilege("SeBackupPrivilege")?;
+    enable_privilege("SeRestorePrivilege")?;
     let wide = to_wide(mount);
     let mut attempt = 1;
     loop {
@@ -340,6 +345,19 @@ fn unload(mount: &str) -> io::Result<()> {
         }
         attempt += 1;
         sleep(UNLOAD_RETRY_DELAY);
+    }
+}
+
+/// Deletes `ProfileList\<sid>`. RegDeleteKeyEx refuses a key that has
+/// subkeys, so this can never remove more than the one entry.
+pub fn delete_profile_list_entry(sid: &str) -> io::Result<()> {
+    let path = format!("{PROFILE_LIST_KEY}\\{sid}");
+    let wide = to_wide(&path);
+    // SAFETY: predefined root and NUL-terminated subkey path.
+    let status = unsafe { RegDeleteKeyExW(HKEY_LOCAL_MACHINE, wide.as_ptr(), KEY_WOW64_64KEY, 0) };
+    match status {
+        0 => Ok(()),
+        code => Err(win32_error(&format!("RegDeleteKeyExW(HKLM\\{path})"), code)),
     }
 }
 

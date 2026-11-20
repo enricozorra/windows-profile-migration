@@ -35,6 +35,18 @@ pub fn probe_exclusive(path: &Path) -> LockState {
     }
 }
 
+/// Creates or opens `path` with no sharing and keeps it open: as long as the
+/// returned handle lives, no other process can open the same lock file.
+pub fn lock_file(path: &Path) -> io::Result<std::fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(path)
+}
+
 /// Bytes available to the caller on the volume that holds `path` (which
 /// honors quotas, unlike the volume total).
 pub fn free_bytes(path: &Path) -> io::Result<u64> {

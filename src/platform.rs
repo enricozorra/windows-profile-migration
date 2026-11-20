@@ -6,10 +6,10 @@
 
 #[cfg(windows)]
 pub use crate::win::{
-    computer_name, create_private_dir, current_token, domain_membership, export_registry_key,
-    file_attributes, free_bytes, hklm_key_exists, loaded_user_hives, local_groups,
-    lookup_account_name, lookup_account_sid, os_version, probe_exclusive, read_profile_list,
-    read_sddl, service_accounts, walk_hive_file, walk_loaded_hive,
+    computer_name, create_private_dir, current_token, delete_profile_list_entry, domain_membership,
+    export_registry_key, file_attributes, free_bytes, hklm_key_exists, loaded_user_hives,
+    local_groups, lock_file, lookup_account_name, lookup_account_sid, os_version, probe_exclusive,
+    read_profile_list, read_sddl, service_accounts, unload_hive, walk_hive_file, walk_loaded_hive,
 };
 
 #[cfg(not(windows))]
@@ -82,6 +82,18 @@ mod unsupported {
     }
 
     pub fn create_private_dir(_path: &Path) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub fn lock_file(_path: &Path) -> io::Result<std::fs::File> {
+        Err(unsupported())
+    }
+
+    pub fn unload_hive(_mount: &str) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub fn delete_profile_list_entry(_sid: &str) -> io::Result<()> {
         Err(unsupported())
     }
 

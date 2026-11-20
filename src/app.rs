@@ -13,7 +13,9 @@ use crate::log::{Level, Logger};
 use crate::model::{LookupOutcome, SkipReason, SystemFacts};
 use crate::plan;
 use crate::preflight::{self, Options, Severity};
+use crate::recovery::RollbackOptions;
 use crate::report;
+use crate::rollback;
 
 pub const EXIT_OK: i32 = 0;
 pub const EXIT_BLOCKED: i32 = 1;
@@ -35,8 +37,9 @@ pub fn run(args: &Args) -> Result<i32, Box<dyn Error>> {
         vec![
             ("version", env!("CARGO_PKG_VERSION").into()),
             ("command", args.command.name().into()),
-            ("source_input", args.source.as_str().into()),
-            ("target_input", args.target.as_str().into()),
+            ("source_input", args.source.clone().into()),
+            ("target_input", args.target.clone().into()),
+            ("migration", args.migration.clone().into()),
             (
                 "profile_path",
                 args.profile_path
@@ -69,10 +72,28 @@ pub fn run(args: &Args) -> Result<i32, Box<dyn Error>> {
 }
 
 fn run_logged(args: &Args, log: &mut Logger) -> Result<i32, Box<dyn Error>> {
+    let migrations_root = base_dir()?.join("migrations");
+    match args.command {
+        Command::Status => return rollback::run_status(&migrations_root, log),
+        Command::Rollback => {
+            let id = args
+                .migration
+                .as_deref()
+                .ok_or("rollback needs --migration")?;
+            let options = RollbackOptions {
+                discard_target_changes: args.discard_target_changes,
+            };
+            return rollback::run_rollback(&migrations_root, id, options, log);
+        }
+        Command::Preflight | Command::Backup | Command::MigrateDryRun => {}
+    }
+    let (Some(source), Some(target)) = (&args.source, &args.target) else {
+        return Err(format!("{} needs --source and --target", args.command.name()).into());
+    };
     eprintln!("gathering system state (read-only)...");
     let facts = facts::gather(&Request {
-        source: args.source.clone(),
-        target: args.target.clone(),
+        source: source.clone(),
+        target: target.clone(),
         work_dir: base_dir()?.join("work"),
     })?;
     log_facts(&facts, log)?;
@@ -120,7 +141,9 @@ fn run_logged(args: &Args, log: &mut Logger) -> Result<i32, Box<dyn Error>> {
     };
 
     match args.command {
-        Command::Preflight => Ok(verdict),
+        // Status and Rollback returned above; listed only to keep the match
+        // exhaustive.
+        Command::Preflight | Command::Status | Command::Rollback => Ok(verdict),
         Command::MigrateDryRun => {
             let changes = plan::build(&facts);
             for change in &changes {

@@ -10,12 +10,18 @@ pub const USAGE: &str = r#"windows-profile-migration - re-map a Windows user pro
 USAGE:
     windows-profile-migration <COMMAND> --source <ACCOUNT> --target <ACCOUNT>
                               [OPTIONS]
+    windows-profile-migration status
+    windows-profile-migration rollback --migration <ID> [--discard-target-changes]
 
 COMMANDS:
     preflight          Run read-only checks and print a pass/fail report
     backup             Run preflight, then snapshot ProfileList, hives and ACLs
     migrate --dry-run  Run preflight and print the changes a migration would make
                        (execution without --dry-run is not implemented yet)
+    status             Show every recorded migration, what it left on the system,
+                       and leftovers that belong to no migration
+    rollback           Undo an unfinished migration; only what its journal lists
+                       and carries its marker is removed
 
 ACCOUNTS:
     --source <ACCOUNT>   PC01\user, .\user, OLDDOMAIN\user, or a SID
@@ -29,11 +35,16 @@ OPTIONS:
     --log-dir <DIR>        Log folder. Default: %WINDOWS_PROFILE_MIGRATION_HOME%\logs,
                            else %ProgramData%\windows-profile-migration\logs
     --backup-dir <DIR>     Backup folder for `backup` (default: ...\backups)
+    --migration <ID>       Migration to roll back (as listed by `status`)
+    --discard-target-changes
+                           Roll back even though the target has used the
+                           migrated profile; its changes there are lost
     -h, --help             Show this help
     -V, --version          Show the version
 
 EXIT CODES:
-    0 success / preflight passed    1 preflight blocked
+    0 success / preflight passed    1 preflight blocked, rollback refused,
+                                      or status needs attention
     2 usage error                   3 runtime error
 "#;
 
@@ -42,6 +53,8 @@ pub enum Command {
     Preflight,
     Backup,
     MigrateDryRun,
+    Status,
+    Rollback,
 }
 
 impl Command {
@@ -50,19 +63,32 @@ impl Command {
             Command::Preflight => "preflight",
             Command::Backup => "backup",
             Command::MigrateDryRun => "migrate-dry-run",
+            Command::Status => "status",
+            Command::Rollback => "rollback",
         }
+    }
+
+    /// Commands that work on a source/target account pair.
+    pub fn needs_accounts(self) -> bool {
+        matches!(
+            self,
+            Command::Preflight | Command::Backup | Command::MigrateDryRun
+        )
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
     pub command: Command,
-    pub source: String,
-    pub target: String,
+    /// Present exactly when `command.needs_accounts()`.
+    pub source: Option<String>,
+    pub target: Option<String>,
     pub profile_path: Option<PathBuf>,
     pub accept: Vec<String>,
     pub log_dir: Option<PathBuf>,
     pub backup_dir: Option<PathBuf>,
+    pub migration: Option<String>,
+    pub discard_target_changes: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +125,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, UsageErr
     let mut accept = Vec::new();
     let mut log_dir = None;
     let mut backup_dir = None;
+    let mut migration = None;
+    let mut discard_target_changes = false;
 
     while let Some(arg) = args.next() {
         let (flag, inline_value) = match arg.split_once('=') {
@@ -115,6 +143,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, UsageErr
             "-h" | "--help" => return Ok(Parsed::Help),
             "-V" | "--version" => return Ok(Parsed::Version),
             "--dry-run" => dry_run = true,
+            "--discard-target-changes" => discard_target_changes = true,
+            "--migration" => set_once(&mut migration, value("--migration")?, "--migration")?,
             "--source" => set_once(&mut source, value("--source")?, "--source")?,
             "--target" => set_once(&mut target, value("--target")?, "--target")?,
             "--profile-path" => set_once(
@@ -159,6 +189,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, UsageErr
     let command = match command_word.as_deref() {
         Some("preflight") => Command::Preflight,
         Some("backup") => Command::Backup,
+        Some("status") => Command::Status,
+        Some("rollback") => Command::Rollback,
         Some("migrate") if dry_run => Command::MigrateDryRun,
         Some("migrate") => {
             return Err(usage(
@@ -174,14 +206,37 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, UsageErr
     if backup_dir.is_some() && command != Command::Backup {
         return Err(usage("--backup-dir only applies to backup"));
     }
+    if command == Command::Rollback && migration.is_none() {
+        return Err(usage("rollback requires --migration <ID> (see `status`)"));
+    }
+    if command != Command::Rollback && (migration.is_some() || discard_target_changes) {
+        return Err(usage(
+            "--migration and --discard-target-changes only apply to rollback",
+        ));
+    }
+    if command.needs_accounts() {
+        if source.is_none() {
+            return Err(usage("--source is required"));
+        }
+        if target.is_none() {
+            return Err(usage("--target is required"));
+        }
+    } else if source.is_some() || target.is_some() || profile_path.is_some() || !accept.is_empty() {
+        return Err(usage(format!(
+            "{} does not take --source, --target, --profile-path or --accept",
+            command.name()
+        )));
+    }
     Ok(Parsed::Run(Args {
         command,
-        source: source.ok_or_else(|| usage("--source is required"))?,
-        target: target.ok_or_else(|| usage("--target is required"))?,
+        source,
+        target,
         profile_path,
         accept,
         log_dir,
         backup_dir,
+        migration,
+        discard_target_changes,
     }))
 }
 
@@ -212,8 +267,8 @@ mod tests {
     fn preflight_with_both_flag_styles() {
         let args = run_args(r"preflight --source .\jdoe --target=CORP\jdoe");
         assert_eq!(args.command, Command::Preflight);
-        assert_eq!(args.source, r".\jdoe");
-        assert_eq!(args.target, r"CORP\jdoe");
+        assert_eq!(args.source.as_deref(), Some(r".\jdoe"));
+        assert_eq!(args.target.as_deref(), Some(r"CORP\jdoe"));
     }
 
     #[test]
@@ -253,6 +308,25 @@ mod tests {
         assert!(parse_str("preflight --force --source a --target b").is_err());
         assert!(parse_str("preflight extra --source a --target b").is_err());
         assert!(parse_str("").is_err());
+    }
+
+    #[test]
+    fn status_and_rollback_take_no_accounts() {
+        assert_eq!(run_args("status").command, Command::Status);
+        assert!(parse_str(r"status --source a\b").is_err());
+        let args = run_args("rollback --migration 20261120T1000Z-1 --discard-target-changes");
+        assert_eq!(args.command, Command::Rollback);
+        assert_eq!(args.migration.as_deref(), Some("20261120T1000Z-1"));
+        assert!(args.discard_target_changes);
+        assert!(args.source.is_none());
+        assert!(parse_str("rollback").is_err());
+        assert!(parse_str(r"rollback --migration x --target c\d").is_err());
+    }
+
+    #[test]
+    fn rollback_options_are_rejected_elsewhere() {
+        assert!(parse_str(r"preflight --source a\b --target c\d --migration x").is_err());
+        assert!(parse_str("status --discard-target-changes").is_err());
     }
 
     #[test]

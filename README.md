@@ -32,6 +32,10 @@ windows-profile-migration backup            --source .\jdoe --target CORP\jdoe [
 
 # Domain A -> B when the old domain no longer resolves:
 windows-profile-migration preflight --source S-1-5-21-...-1105 --target NEWCORP\jdoe --accept SOURCE_ACCOUNT
+
+# Recovery:
+windows-profile-migration status
+windows-profile-migration rollback --migration <ID> [--discard-target-changes]
 ```
 
 Accounts must be qualified (`PC01\user`, `.\user`, `DOMAIN\user`,
@@ -41,7 +45,7 @@ local account before the domain one.
 | Exit code | Meaning |
 |---|---|
 | 0 | success / preflight passed (warnings allowed) |
-| 1 | preflight blocked |
+| 1 | preflight blocked, rollback refused, or `status` found something unfinished |
 | 2 | usage error |
 | 3 | runtime error |
 
@@ -50,6 +54,25 @@ to `--log-dir`, else `%WINDOWS_PROFILE_MIGRATION_HOME%\logs`, else
 `%ProgramData%\windows-profile-migration\logs`.
 Backups go to a new folder whose DACL admits only SYSTEM and Administrators,
 because it contains copies of the user's hives.
+
+## Recovery
+
+Each migration keeps an append-only journal in
+`%ProgramData%\windows-profile-migration\migrations\<id>\`. Before creating
+anything (working copy, folder, ProfileList entry, temporary hive mount)
+it records the intent and syncs it to disk, so after a crash or reboot the
+journal lists everything that may exist.
+
+- `status` compares every journal with the live system, shows the phase
+  and what rollback would do, and lists leftovers that carry the tool's
+  naming but belong to no journal.
+- `rollback` undoes in reverse order: mounts, then the ProfileList entry,
+  then folders. It only removes what the journal lists **and** what carries
+  the migration's marker (a marker file in folders, a marker value in the
+  ProfileList entry); anything else stops it. It refuses while the target
+  is logged on, and after the target has used the migrated profile unless
+  `--discard-target-changes` is given. Every step is journaled, so an
+  interrupted rollback is simply run again.
 
 ## Application catalog
 
@@ -82,6 +105,9 @@ src/
   apps.rs           application catalog (detection only)
   hive_scan.rs      registry value analysis: old paths, app settings (pure)
   references.rs     services/scheduled tasks running as the source (pure)
+  journal.rs        append-only migration journal: format and replay
+  recovery.rs       rollback decisions and status rendering (pure)
+  rollback.rs       status/rollback: observe the system, undo, journal
   backup.rs         ProfileList .reg export, hive copies, ACL manifest
   scan.rs           profile walk that never follows reparse points
   sddl.rs sid.rs account.rs os_support.rs profile_state.rs   pure helpers
@@ -89,7 +115,8 @@ src/
   platform.rs       the only OS seam; non-Windows stubs return Unsupported
   win/              Win32 FFI (the only place `unsafe` is allowed)
 scripts/
-  vm-validate.ps1   end-to-end checks on a disposable VM
+  vm-validate.ps1           end-to-end checks of preflight/dry-run/backup
+  vm-validate-rollback.ps1  simulated interrupted migrations vs status/rollback
 ```
 
 All decision logic is platform-neutral, so `cargo test` runs on macOS or
@@ -135,7 +162,7 @@ before and after preflight and dry-run. Run it on a disposable snapshot only.
 
 - Execution: copy, rewrite, verify, commit. `migrate` without `--dry-run`
   is refused.
-- Rollback and finalize.
+- Finalize (retire the source account and profile).
 
 ## Contributing
 
