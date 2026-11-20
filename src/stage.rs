@@ -14,6 +14,7 @@ use std::path::Path;
 
 use crate::app::EXIT_OK;
 use crate::copy::{self, CopyClass, CopyPaths, Manifest, MANIFEST_FILE};
+use crate::hives;
 use crate::journal::{ArtifactKind, JournalWriter, JOURNAL_FILE, LOCK_FILE};
 use crate::json::Json;
 use crate::log::{Level, Logger};
@@ -21,6 +22,7 @@ use crate::model::SystemFacts;
 use crate::platform;
 use crate::preflight::format_bytes;
 use crate::recovery::RollbackOptions;
+use crate::rewrite::Substitution;
 use crate::rollback;
 use crate::timefmt;
 
@@ -67,6 +69,15 @@ impl Subject {
             target_path: dir.path.display().to_string(),
             staging_path: dir.staging_path.display().to_string(),
         })
+    }
+
+    fn substitution(&self) -> Substitution {
+        Substitution {
+            source_sid: self.source_sid.clone(),
+            target_sid: self.target_sid.clone(),
+            source_path: self.source_path.clone(),
+            target_path: self.target_path.clone(),
+        }
     }
 }
 
@@ -160,11 +171,11 @@ fn stage(subject: &Subject, id: &str, dir: &Path, log: &mut Logger) -> Result<()
     )?;
     platform::enable_copy_privileges()?;
 
+    let substitution = subject.substitution();
     let paths = CopyPaths {
         source: Path::new(&subject.source_path),
         staging: Path::new(&subject.staging_path),
-        retarget_from: &subject.source_path,
-        retarget_to: &subject.target_path,
+        substitution: &substitution,
     };
     let staging = [
         ("kind", ArtifactKind::StagingDir.name()),
@@ -187,6 +198,7 @@ fn stage(subject: &Subject, id: &str, dir: &Path, log: &mut Logger) -> Result<()
         ("files", outcome.count(CopyClass::File).to_string()),
         ("links", outcome.count(CopyClass::Link).to_string()),
         ("retargeted_links", outcome.retargeted.len().to_string()),
+        ("security_translated", outcome.translated.to_string()),
         ("cloud_only_skipped", outcome.cloud_only.len().to_string()),
         ("bytes", outcome.bytes.to_string()),
     ];
@@ -210,6 +222,10 @@ fn stage(subject: &Subject, id: &str, dir: &Path, log: &mut Logger) -> Result<()
         outcome.count(CopyClass::Link),
         outcome.retargeted.len(),
         format_bytes(outcome.bytes)
+    );
+    println!(
+        "    {} security descriptors moved from {} to {}",
+        outcome.translated, subject.source_sid, subject.target_sid
     );
     for relative in &outcome.cloud_only {
         log.event(Level::Warn, PHASE, "cloud_only_skipped", relative, vec![])?;
@@ -256,12 +272,105 @@ fn stage(subject: &Subject, id: &str, dir: &Path, log: &mut Logger) -> Result<()
         vec![("entries", outcome.entries.len().into())],
     )?;
     println!(
-        "    verified: all {} entries match the source (content SHA-256, attributes, timestamps, security, streams, link targets)",
+        "    verified: all {} entries match the source (content SHA-256, attributes, timestamps, translated security, streams, link targets)",
         outcome.entries.len()
     );
+
+    rewrite_hives(subject, id, &substitution, &mut journal, log)?;
+
     println!(
         "\nWorking copy ready: {}\nNothing outside it was changed; {} still logs on to {}.\nTo remove it: windows-profile-migration rollback --migration {id}",
         subject.staging_path, subject.source_name, subject.source_path
     );
+    Ok(())
+}
+
+/// Rewrites and verifies each hive of the copy, journaling every mount.
+fn rewrite_hives(
+    subject: &Subject,
+    id: &str,
+    substitution: &Substitution,
+    journal: &mut JournalWriter,
+    log: &mut Logger,
+) -> Result<(), Box<dyn Error>> {
+    for hive in hives::hive_files(Path::new(&subject.staging_path)) {
+        println!("rewriting registry hive {}...", hive.path.display());
+        let outcome = hives::rewrite(&hive, id, substitution, journal)?;
+        let report = &outcome.report;
+        let counts = [
+            ("keys_translated", report.keys_translated.to_string()),
+            (
+                "values_rewritten",
+                report.values_rewritten.len().to_string(),
+            ),
+            ("keys_skipped", outcome.skipped.keys.len().to_string()),
+            ("values_skipped", outcome.skipped.values.len().to_string()),
+            ("residues", report.residues.len().to_string()),
+            ("names", report.names.len().to_string()),
+        ];
+        let mut fields: Vec<(&str, &str)> = vec![
+            ("name", "rewrite_hive"),
+            ("hive", outcome.label),
+            ("state", "done"),
+        ];
+        fields.extend(counts.iter().map(|(k, v)| (*k, v.as_str())));
+        journal.append("step", &fields)?;
+        log.event(
+            Level::Info,
+            PHASE,
+            "hive_rewritten",
+            &hive.path.display().to_string(),
+            counts
+                .iter()
+                .map(|(k, v)| (*k, Json::from(v.as_str())))
+                .collect(),
+        )?;
+        for place in &report.values_rewritten {
+            log.event(Level::Info, PHASE, "value_rewritten", place, vec![])?;
+        }
+        // Everything still pointing at the source is listed, so it can be
+        // fixed by hand or by an application-specific step later.
+        let leftovers = outcome
+            .skipped
+            .keys
+            .iter()
+            .map(|key| {
+                let key = if key.is_empty() { "(root)" } else { key };
+                format!("key {key}: Windows refuses changes to its security")
+            })
+            .chain(
+                outcome
+                    .skipped
+                    .values
+                    .iter()
+                    .map(|(place, why)| format!("{place}: {why}")),
+            )
+            .chain(report.residues.iter().cloned())
+            .chain(
+                report
+                    .names
+                    .iter()
+                    .map(|n| format!("{n}: the name mentions the source")),
+            );
+        let mut shown = 0;
+        for leftover in leftovers {
+            log.event(Level::Warn, PHASE, "hive_leftover", &leftover, vec![])?;
+            if shown < SHOWN_PROBLEMS {
+                println!("    left as is: {leftover}");
+            }
+            shown += 1;
+        }
+        if shown > SHOWN_PROBLEMS {
+            println!(
+                "    ... and {} more (all in the log)",
+                shown - SHOWN_PROBLEMS
+            );
+        }
+        println!(
+            "    {} key permissions and {} values rewritten; reloaded and verified",
+            report.keys_translated,
+            report.values_rewritten.len()
+        );
+    }
     Ok(())
 }

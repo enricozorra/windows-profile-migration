@@ -8,13 +8,17 @@
 
       S1  the working copy is built and verified (exit 0) next to the target
           folder, with our marker, and `status` reports it as preparing
-      S2  content, alternate data streams, attributes, timestamps, ACLs,
-          a sparse file, long and Unicode paths arrive unchanged
+      S2  content, alternate data streams, attributes, timestamps, a sparse
+          file, long and Unicode paths arrive unchanged; ACLs and owners
+          name the target instead of the source; integrity labels survive
       S3  a junction into the profile is retargeted to the target folder,
           a junction elsewhere and a relative symlink are kept as they were
       S4  `rollback` removes the copy and leaves the source alone
       S5  a copy that cannot be completed (a source file held open by
           another process) is removed automatically, exit 3
+      S6  the copy's NTUSER.DAT: paths and the SID in text values are
+          rewritten, similar paths, loose mentions and binary data are left
+          alone and reported, key ACEs name the target
 
     Optionally (-RealSource) the same build/verify/rollback cycle runs on an
     existing profile. Throughout, the source profiles must stay unchanged.
@@ -37,6 +41,7 @@ $ErrorActionPreference = 'Stop'
 $Marker = '.windows-profile-migration'
 $StagingSuffix = '.windows-profile-migration-staging'
 $script:Failures = 0
+$script:Mounts = New-Object System.Collections.Generic.List[string]
 
 function Assert-Admin {
     $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -99,6 +104,15 @@ function Get-TreeFingerprint([string] $Root, [string] $Sid, [switch] $Quick) {
     ($lines | Sort-Object) -join "`n"
 }
 
+# Compares the source with the baseline and, on a difference, shows the
+# first lines that changed.
+function Test-SourceUnchanged([string] $Name) {
+    $now = Get-TreeFingerprint $script:Source $script:Sid
+    $diff = Compare-Object ($script:Baseline -split "`n") ($now -split "`n") |
+        Select-Object -First 6 | ForEach-Object { "$($_.SideIndicator) $($_.InputObject)" }
+    Write-Result $Name ($now -eq $script:Baseline) ($diff -join ' | ')
+}
+
 # fsutil for junctions: Windows PowerShell 5.1 cannot read the target of
 # the legacy ones, whose ACL denies listing to Everyone. fsutil does not
 # decode symbolic links, which Get-Item reads fine.
@@ -106,6 +120,18 @@ function Get-LinkTarget([string] $Path) {
     $line = & fsutil reparsepoint query $Path | Select-String -Pattern '^Print Name:\s*(.*)$'
     if ($line) { return $line.Matches[0].Groups[1].Value.Trim() }
     @((Get-Item -LiteralPath $Path -Force).Target)[0]
+}
+
+# The registry provider keeps handles open until they are collected, and
+# other processes can briefly hold a freshly loaded hive: retry.
+function Dismount-TestHive([string] $Mount) {
+    for ($i = 0; $i -lt 15; $i++) {
+        [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+        & reg.exe unload "HKU\$Mount" 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { [void]$script:Mounts.Remove($Mount); return }
+        Start-Sleep -Seconds 2
+    }
+    throw "could not unload HKU\$Mount"
 }
 
 function Get-Sddl([string] $Path) {
@@ -145,6 +171,31 @@ try {
     (Get-Item -LiteralPath "$docs\hidden-readonly.txt").Attributes = 'Hidden, ReadOnly'
     Set-Content -LiteralPath "$docs\explicit-acl.txt" -Value 'acl'
     & icacls "$docs\explicit-acl.txt" /inheritance:d /grant 'Everyone:(R)' | Out-Null
+    & icacls "$docs\explicit-acl.txt" /grant "*$($sid):(M)" | Out-Null
+
+    # Registry values the rewrite must handle, written into the source hive
+    # before anything is copied (the hive is not loaded: the user never
+    # logged on).
+    $mount = 'pmst_source_' + (Get-Random)
+    & reg.exe load "HKU\$mount" "$source\NTUSER.DAT" | Out-Null
+    $script:Mounts.Add($mount)
+    $key = "Registry::HKEY_USERS\$mount\Software\pmtest"
+    New-Item -Path $key -Force | Out-Null
+    New-ItemProperty -Path $key -Name 'Path' -Value "$source\Documents\x.txt" | Out-Null
+    New-ItemProperty -Path $key -Name 'Expand' -PropertyType ExpandString -Value "$source\AppData;%TEMP%" | Out-Null
+    New-ItemProperty -Path $key -Name 'Multi' -PropertyType MultiString -Value @('keep', "$source\Music") | Out-Null
+    New-ItemProperty -Path $key -Name 'Sid' -Value "$($sid)_Classes" | Out-Null
+    New-ItemProperty -Path $key -Name 'Similar' -Value "$($source)2\x" | Out-Null
+    New-ItemProperty -Path $key -Name 'Loose' -Value "$source -flag" | Out-Null
+    $pathBytes = [Text.Encoding]::Unicode.GetBytes("$source\bin")
+    New-ItemProperty -Path $key -Name 'Binary' -PropertyType Binary -Value $pathBytes | Out-Null
+    # An explicit ACE for the user (changing the owner would need the
+    # restore privilege switched on in this process).
+    $acl = Get-Acl -Path $key
+    $rule = New-Object Security.AccessControl.RegistryAccessRule ((New-Object Security.Principal.SecurityIdentifier $sid), 'FullControl', 'Allow')
+    $acl.AddAccessRule($rule)
+    Set-Acl -Path $key -AclObject $acl
+    Dismount-TestHive $mount
     # Built from code points: Windows PowerShell 5.1 reads a script without
     # a BOM as ANSI.
     $unicodeName = "citt$([char]0xE0) $([char]0x2713).txt"
@@ -154,6 +205,10 @@ try {
     & fsutil sparse setflag $sparse | Out-Null
     $fs = [IO.File]::OpenWrite($sparse); $fs.SetLength(64MB); $fs.Dispose()
     & fsutil sparse setrange $sparse 1048576 33554432 | Out-Null
+    # A fresh profile has no LocalLow yet; give it one with its usual low
+    # integrity label.
+    New-Item -ItemType Directory -Path "$source\AppData\LocalLow" -Force | Out-Null
+    & icacls "$source\AppData\LocalLow" /setintegritylevel '(OI)(CI)low' | Out-Null
     $deep = $docs
     while ($deep.Length -lt 300) { $deep = Join-Path $deep 'a-rather-long-folder-name' }
     [IO.Directory]::CreateDirectory("\\?\$deep") | Out-Null
@@ -167,7 +222,17 @@ try {
     cmd /c mklink "relative-link.txt" "plain.txt" | Out-Null
     Pop-Location
 
+    # Windows keeps writing to a freshly created profile for a moment (seen:
+    # AppData\Local\Microsoft\Windows touched a few seconds after setup),
+    # so the baseline is taken once the tree has been stable for 5 seconds.
     $baseline = Get-TreeFingerprint $source $sid
+    for ($i = 0; $i -lt 12; $i++) {
+        Start-Sleep -Seconds 5
+        $again = Get-TreeFingerprint $source $sid
+        if ($again -eq $baseline) { break }
+        $baseline = $again
+    }
+    $script:Source = $source; $script:Sid = $sid; $script:Baseline = $baseline
 
     # --- S1: build and verify --------------------------------------------
     $r = Invoke-Tool @('migrate', '--stage-only', '--source', ".\$testUser", '--target', $TargetAccount)
@@ -177,6 +242,7 @@ try {
     if ($r.Output -match '(?m)^Working copy ready: (.+)$') { $staging = $Matches[1].Trim() }
     $targetPath = $staging.Substring(0, $staging.Length - $StagingSuffix.Length)
     Write-Host "copy at $staging (target $targetPath), migration $id"
+    $targetSid = (New-Object Security.Principal.NTAccount $TargetAccount).Translate([Security.Principal.SecurityIdentifier]).Value
     Write-Result 'S1: copy carries the marker of its migration' ((Get-Content -LiteralPath "$staging\$Marker" -Raw).Trim() -eq $id)
     Write-Result 'S1: the target folder itself was not created' (-not (Test-Path -LiteralPath $targetPath))
     $s = Invoke-Tool @('status')
@@ -196,9 +262,46 @@ try {
     Write-Result 'S2: hidden and read-only attributes kept' (($attrs -band [IO.FileAttributes]::Hidden) -and ($attrs -band [IO.FileAttributes]::ReadOnly)) "$attrs"
     $src = Get-Item -LiteralPath "$docs\plain.txt"; $dst = Get-Item -LiteralPath "$copyDocs\plain.txt"
     Write-Result 'S2: timestamps kept' (($src.LastWriteTimeUtc -eq $dst.LastWriteTimeUtc) -and ($src.CreationTimeUtc -eq $dst.CreationTimeUtc))
-    Write-Result 'S2: explicit ACL kept' ((Get-Sddl "$docs\explicit-acl.txt") -eq (Get-Sddl "$copyDocs\explicit-acl.txt"))
-    Write-Result 'S2: profile folder ACL kept' ((Get-Sddl $source) -eq (Get-Sddl $staging))
-    Write-Result 'S2: owner is still the source user (rewritten later)' ((Get-Acl -LiteralPath "$copyDocs\plain.txt").Owner -eq (Get-Acl -LiteralPath "$docs\plain.txt").Owner)
+    Write-Result 'S2: explicit ACL kept, source SID translated' ((Get-Sddl "$docs\explicit-acl.txt").Replace($sid, $targetSid) -eq (Get-Sddl "$copyDocs\explicit-acl.txt"))
+    Write-Result 'S2: profile folder ACL kept, source SID translated' ((Get-Sddl $source).Replace($sid, $targetSid) -eq (Get-Sddl $staging))
+    # Files the test wrote as SYSTEM are owned by Administrators; the hive
+    # CreateProfile wrote is owned by the user.
+    $owner = { param($p) (Get-Acl -LiteralPath $p).GetOwner([Security.Principal.SecurityIdentifier]).Value }
+    Write-Result 'S2: owners translated (source user -> target, others kept)' (((& $owner "$source\NTUSER.DAT") -eq $sid) -and ((& $owner "$staging\NTUSER.DAT") -eq $targetSid) -and ((& $owner "$copyDocs\plain.txt") -eq (& $owner "$docs\plain.txt")))
+    # Windows PowerShell 5.1 cannot open paths beyond MAX_PATH; the tool's
+    # own verification covers those.
+    $copySddls = Get-ChildItem -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue -Attributes !ReparsePoint |
+        Where-Object { $_.FullName.Length -lt 248 } | ForEach-Object { Get-Sddl $_.FullName }
+    Write-Result 'S2: no file in the copy names the source SID' (($copySddls.Count -gt 100) -and -not ($copySddls -match [regex]::Escape($sid))) "$($copySddls.Count) checked"
+    $label = (& icacls "$staging\AppData\LocalLow" | Out-String)
+    Write-Result 'S2: LocalLow keeps its low integrity label' ($label -match 'Low Mandatory Level') $label
+
+    # --- S6: the copy's registry ------------------------------------------
+    $mount = 'pmst_copy_' + (Get-Random)
+    & reg.exe load "HKU\$mount" "$staging\NTUSER.DAT" | Out-Null
+    $script:Mounts.Add($mount)
+    try {
+        $v = Get-ItemProperty -Path "Registry::HKEY_USERS\$mount\Software\pmtest"
+        Write-Result 'S6: path value rewritten' ($v.Path -eq "$targetPath\Documents\x.txt") $v.Path
+        # Read without expansion: the provider would turn %TEMP% into a path.
+        $raw = [Microsoft.Win32.Registry]::Users.OpenSubKey("$mount\Software\pmtest")
+        $expand = $raw.GetValue('Expand', $null, 'DoNotExpandEnvironmentNames')
+        $raw.Dispose()
+        Write-Result 'S6: expandable value rewritten' ($expand -eq "$targetPath\AppData;%TEMP%") $expand
+        Write-Result 'S6: multi-string rewritten, other items kept' (($v.Multi[0] -eq 'keep') -and ($v.Multi[1] -eq "$targetPath\Music")) ($v.Multi -join '|')
+        Write-Result 'S6: SID in text rewritten' ($v.Sid -eq "$($targetSid)_Classes") $v.Sid
+        Write-Result 'S6: similar path left alone' ($v.Similar -eq "$($source)2\x") $v.Similar
+        Write-Result 'S6: loose mention left alone' ($v.Loose -eq "$source -flag") $v.Loose
+        Write-Result 'S6: binary value left alone' ([Text.Encoding]::Unicode.GetString($v.Binary) -eq "$source\bin")
+        $keySddl = (Get-Acl -Path "Registry::HKEY_USERS\$mount\Software\pmtest").Sddl
+        Write-Result 'S6: key ACE names the target, not the source' (($keySddl -match [regex]::Escape($targetSid)) -and ($keySddl -notmatch [regex]::Escape($sid))) $keySddl
+        $rootSddl = (Get-Acl -Path "Registry::HKEY_USERS\$mount").Sddl
+        Write-Result 'S6: hive root ACL names the target, not the source' (($rootSddl -match [regex]::Escape($targetSid)) -and ($rootSddl -notmatch [regex]::Escape($sid))) $rootSddl
+    } finally {
+        Dismount-TestHive $mount
+    }
+    Write-Result 'S6: the tool reported what it left as is' (($r.Output -match 'left as is: .*Loose') -and ($r.Output -match 'left as is: .*Binary')) $r.Output
+
     $sparseFlag = (& fsutil sparse queryflag "$copyDocs\sparse.bin" | Out-String)
     Write-Result 'S2: sparse file stays sparse' ($sparseFlag -match 'is set|impostato|SET') $sparseFlag
     $deepCopy = "\\?\" + $deep.Replace($source, $staging) + '\deep.txt'
@@ -212,14 +315,14 @@ try {
     if (Test-Path -LiteralPath "$source\Application Data") {
         Write-Result 'S3: legacy Application Data junction retargeted' ((Get-LinkTarget $appData) -eq "$targetPath\AppData\Roaming") (Get-LinkTarget $appData)
     }
-    Write-Result 'S3: source unchanged after the copy' ((Get-TreeFingerprint $source $sid) -eq $baseline)
+    Test-SourceUnchanged 'S3: source unchanged after the copy'
 
     # --- S4: rollback --------------------------------------------------------
     $r = Invoke-Tool @('rollback', '--migration', $id)
     Write-Result 'S4: rollback succeeds (exit 0)' ($r.ExitCode -eq 0) $r.Output
     Write-Result 'S4: working copy removed' (-not (Test-Path -LiteralPath $staging))
     if (-not (Test-Path -LiteralPath $staging)) { $staging = $null }
-    Write-Result 'S4: source unchanged after the rollback' ((Get-TreeFingerprint $source $sid) -eq $baseline)
+    Test-SourceUnchanged 'S4: source unchanged after the rollback'
 
     # --- S5: a copy that cannot be completed --------------------------------
     $holder = [IO.File]::Open("$docs\random.bin", 'Open', 'ReadWrite', 'None')
@@ -230,7 +333,7 @@ try {
     Write-Result 'S5: the partial copy was removed automatically' (($r.Output -match 'system is as it was') -and -not (Test-Path -LiteralPath "$targetPath$StagingSuffix"))
     $journal = Get-Content -LiteralPath (Join-Path $WorkDir "migrations\$failedId\journal.log")
     Write-Result 'S5: journal records the rollback' ($journal[-1] -match 'rollback_done')
-    Write-Result 'S5: source unchanged' ((Get-TreeFingerprint $source $sid) -eq $baseline)
+    Test-SourceUnchanged 'S5: source unchanged'
 
     # --- optional: an existing profile -----------------------------------------
     if ($RealSource) {
@@ -254,6 +357,7 @@ try {
 }
 finally {
     if ($holder) { $holder.Dispose() }
+    foreach ($m in @($script:Mounts)) { Dismount-TestHive $m }
     if ($staging -and (Test-Path -LiteralPath $staging)) {
         Write-Host "leaving $staging for inspection; remove it with rollback"
     }

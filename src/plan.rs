@@ -131,7 +131,8 @@ pub fn build(facts: &SystemFacts) -> Vec<PlannedChange> {
                     "explicit ACEs {source_sid} -> {target_sid} on {} entries ({} with protected DACLs)",
                     scan.explicit_source_aces.count, scan.protected_dacls_with_source.count
                 ),
-                "SYSTEM, Administrators and inherited ACEs are left as they are".into(),
+                "translated while copying, inherited ACEs included; other SIDs are kept byte for byte"
+                    .into(),
             ],
         });
     }
@@ -191,7 +192,10 @@ fn hive_step(
     let mut lines = vec![
         "NTUSER.DAT and UsrClass.dat are rewritten in the copy; the originals are never loaded"
             .into(),
-        format!("{source_sid} -> {target_sid} in every key owner and explicit ACE"),
+        format!("{source_sid} -> {target_sid} in every key owner and ACE, and in text values"),
+        "UserChoice keys (default apps for http, https, .pdf) are protected by Windows and \
+         left as they are: Windows resets those defaults at the first logon"
+            .into(),
     ];
     match &facts.registry {
         Some(Ok(inspection)) => {
@@ -205,6 +209,13 @@ fn hive_step(
                     inspection.binary_path_refs.len()
                 ));
             }
+            if !inspection.loose_path_refs.is_empty() {
+                lines.push(format!(
+                    "{} text values that mention {source} but not as a whole path are reported, not rewritten",
+                    inspection.loose_path_refs.len()
+                ));
+            }
+            lines.push("each hive is reloaded and checked after the rewrite".into());
         }
         _ => lines.push(format!(
             "text values containing {source} -> {target} (not counted: registry not inspected)"

@@ -12,8 +12,8 @@ use windows_sys::Win32::Security::Authorization::{
     SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
 };
 use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 
@@ -26,8 +26,11 @@ use super::wide::{
 /// %ProgramData% subfolders otherwise inherit write access for Users.
 const PRIVATE_DIR_SDDL: &str = "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
-const SDDL_PARTS: u32 =
+pub const SDDL_PARTS: u32 =
     OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+/// What the working copy compares: also the integrity label (LocalLow is
+/// "Low"), which needs no extra privilege to read, unlike the audit SACL.
+const COMPARED_PARTS: u32 = SDDL_PARTS | LABEL_SECURITY_INFORMATION;
 
 /// Owner, group and DACL of `path` as SDDL. The SACL is not requested: that
 /// needs SeSecurityPrivilege enabled and the tool never changes SACLs.
@@ -52,10 +55,10 @@ pub fn read_sddl(path: &Path) -> io::Result<String> {
         return Err(win32_error("GetNamedSecurityInfoW", code));
     }
     let _descriptor = LocalBox(descriptor);
-    descriptor_to_sddl(descriptor)
+    descriptor_to_sddl(descriptor, SDDL_PARTS)
 }
 
-/// Owner, group and DACL of an open handle (which needs READ_CONTROL) as
+/// Owner, group, DACL and integrity label of an open handle (which needs READ_CONTROL) as
 /// SDDL. Unlike `read_sddl` this sees a junction itself, not its target.
 pub fn handle_sddl(handle: HANDLE) -> io::Result<String> {
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
@@ -65,7 +68,7 @@ pub fn handle_sddl(handle: HANDLE) -> io::Result<String> {
         GetSecurityInfo(
             handle,
             SE_FILE_OBJECT,
-            SDDL_PARTS,
+            COMPARED_PARTS,
             null_mut(),
             null_mut(),
             null_mut(),
@@ -77,17 +80,17 @@ pub fn handle_sddl(handle: HANDLE) -> io::Result<String> {
         return Err(win32_error("GetSecurityInfo", code));
     }
     let _descriptor = LocalBox(descriptor);
-    descriptor_to_sddl(descriptor)
+    descriptor_to_sddl(descriptor, COMPARED_PARTS)
 }
 
-fn descriptor_to_sddl(descriptor: PSECURITY_DESCRIPTOR) -> io::Result<String> {
+pub fn descriptor_to_sddl(descriptor: PSECURITY_DESCRIPTOR, parts: u32) -> io::Result<String> {
     let mut text: *mut u16 = null_mut();
     // SAFETY: the caller passes a valid descriptor it still owns.
     let ok = unsafe {
         ConvertSecurityDescriptorToStringSecurityDescriptorW(
             descriptor,
             SDDL_REVISION_1,
-            SDDL_PARTS,
+            parts,
             &mut text,
             null_mut(),
         )

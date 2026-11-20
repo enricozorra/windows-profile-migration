@@ -9,9 +9,9 @@ pub use crate::win::{
     computer_name, copy_entry, create_private_dir, current_token, delete_profile_list_entry,
     delete_tree, domain_membership, enable_copy_privileges, export_registry_key, file_attributes,
     free_bytes, hash_data, hklm_key_exists, list_dir, loaded_user_hives, local_groups, lock_file,
-    lookup_account_name, lookup_account_sid, os_version, probe_exclusive, read_entry,
-    read_profile_list, read_sddl, service_accounts, set_times, unload_hive, walk_hive_file,
-    walk_loaded_hive,
+    lookup_account_name, lookup_account_sid, mount_hive, os_version, probe_exclusive, read_entry,
+    read_profile_list, read_sddl, rewrite_hive, service_accounts, set_times, unload_hive,
+    walk_hive_file, walk_loaded_hive,
 };
 
 #[cfg(not(windows))]
@@ -24,10 +24,11 @@ mod unsupported {
     use std::path::Path;
 
     use crate::model::{
-        CopiedEntry, DomainMembership, EntryFacts, LockState, LookupOutcome, OsVersion,
+        CopiedEntry, DomainMembership, EntryFacts, HiveSkips, LockState, LookupOutcome, OsVersion,
         ProfileListSnapshot, RegData, TokenInfo,
     };
     use crate::scan::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT};
+    use crate::secdesc::Edited;
 
     const MESSAGE: &str = "windows-profile-migration only runs on Windows";
 
@@ -108,6 +109,7 @@ mod unsupported {
         _dest: &Path,
         _is_dir: bool,
         _reparse: Option<&[u8]>,
+        _edit_security: &dyn Fn(&[u8]) -> Edited,
     ) -> io::Result<CopiedEntry> {
         Err(unsupported())
     }
@@ -121,6 +123,18 @@ mod unsupported {
     }
 
     pub fn set_times(_path: &Path, _created: i64, _written: i64) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub fn mount_hive(_path: &Path, _mount: &str) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub fn rewrite_hive(
+        _mount: &str,
+        _security: &mut dyn FnMut(&str, &[u8]) -> Edited,
+        _value: &mut dyn FnMut(&str, &str, &RegData) -> Option<RegData>,
+    ) -> io::Result<HiveSkips> {
         Err(unsupported())
     }
 

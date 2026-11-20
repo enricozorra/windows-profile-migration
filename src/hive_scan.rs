@@ -8,6 +8,7 @@
 //! Outlook data files, OneDrive accounts).
 
 use crate::model::{RegData, RegistryInspection};
+use crate::rewrite::replace_path;
 
 const OUTLOOK_DATA_EXTENSIONS: &[&str] = &[".pst", ".ost"];
 /// Shortest UTF-16 run worth treating as a string inside a binary value.
@@ -35,16 +36,8 @@ impl Inspector {
         self.result.values_scanned += 1;
         let location = format!("{hive}\\{key}\\{value}");
         match data {
-            RegData::Text(text) => {
-                if contains_path(text, &self.profile_path) {
-                    self.result.text_path_refs.push(location);
-                }
-            }
-            RegData::MultiText(items) => {
-                if items.iter().any(|t| contains_path(t, &self.profile_path)) {
-                    self.result.text_path_refs.push(location);
-                }
-            }
+            RegData::Text(text) => self.classify_text(std::slice::from_ref(text), location),
+            RegData::MultiText(items) => self.classify_text(items, location),
             RegData::Binary(bytes) => {
                 if binary_contains_path(bytes, &self.profile_path) {
                     self.result.binary_path_refs.push(location);
@@ -114,6 +107,20 @@ impl Inspector {
                     format!("{} -> {folder}", parts[4]),
                 );
             }
+        }
+    }
+
+    /// Text the migration rewrites (the folder as a whole path component,
+    /// the same rule `rewrite` applies) versus text that only mentions it.
+    fn classify_text(&mut self, items: &[String], location: String) {
+        let profile = self.profile_path.as_str();
+        if items
+            .iter()
+            .any(|t| replace_path(t, profile, profile).is_some())
+        {
+            self.result.text_path_refs.push(location);
+        } else if items.iter().any(|t| contains_path(t, profile)) {
+            self.result.loose_path_refs.push(location);
         }
     }
 
@@ -368,5 +375,31 @@ mod tests {
         );
         assert_eq!(result.text_path_refs.len(), 1);
         assert_eq!(result.binary_path_refs.len(), 1);
+    }
+
+    #[test]
+    fn loose_mentions_are_kept_apart_from_rewritable_paths() {
+        let mut inspector = Inspector::new(r"C:\Users\Test", "private copy");
+        inspector.visit(
+            "HKCU",
+            "App",
+            "Dir",
+            &RegData::Text(r"C:\Users\Test\x".into()),
+        );
+        inspector.visit(
+            "HKCU",
+            "App",
+            "Cmd",
+            &RegData::Text(r"C:\Users\Test -flag".into()),
+        );
+        inspector.visit(
+            "HKCU",
+            "App",
+            "Other",
+            &RegData::Text(r"C:\Users\Tester".into()),
+        );
+        let result = inspector.finish();
+        assert_eq!(result.text_path_refs, vec![r"HKCU\App\Dir".to_string()]);
+        assert_eq!(result.loose_path_refs, vec![r"HKCU\App\Cmd".to_string()]);
     }
 }

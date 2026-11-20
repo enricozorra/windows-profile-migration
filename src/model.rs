@@ -310,6 +310,16 @@ pub struct CopiedEntry {
     pub sha256: Option<[u8; 32]>,
 }
 
+/// What a hive rewrite left as it is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HiveSkips {
+    /// Key paths (empty for the root) whose security Windows refused to
+    /// change.
+    pub keys: Vec<String>,
+    /// Values (`key\name`) left as they are, with the reason.
+    pub values: Vec<(String, String)>,
+}
+
 /// Registry data in a platform-neutral shape, as handed to the inspector.
 // Some variants are only constructed by the Windows platform layer.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -328,9 +338,13 @@ pub struct RegistryInspection {
     /// "private copy" (an app-hive load of a copy, never the original).
     pub method: String,
     pub values_scanned: usize,
-    /// Every text value that contains the old profile path, as
-    /// `HIVE\key\value`. Complete, so the log lists all of them.
+    /// Every text value the migration rewrites because it contains the old
+    /// profile path as a whole path component, as `HIVE\key\value`.
+    /// Complete, so the log lists all of them.
     pub text_path_refs: Vec<String>,
+    /// Text values that mention the old path in a way the rewrite does not
+    /// accept as a path (e.g. followed by a space): left as they are.
+    pub loose_path_refs: Vec<String>,
     /// Binary values that embed the old path as UTF-16 or ANSI text.
     pub binary_path_refs: Vec<String>,
     /// `Z: -> \\server\share`.

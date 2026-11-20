@@ -8,6 +8,10 @@
 //! copied, because reading them would download them; the cloud service
 //! still holds them.
 //!
+//! Security descriptors are translated on the way in: the source SID
+//! becomes the target SID (see `rewrite`), so the copy never carries the
+//! old owner. Everything else is copied as it is.
+//!
 //! The verification walks the finished copy independently and compares it
 //! entry by entry with what the copy recorded, then checks that the source
 //! did not change while it was being copied.
@@ -22,6 +26,7 @@ use crate::journal::{self, FOLDER_MARKER_FILE};
 use crate::model::EntryFacts;
 use crate::platform;
 use crate::reparse;
+use crate::rewrite::Substitution;
 use crate::scan::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_OFFLINE, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
     FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -136,8 +141,9 @@ impl EntryRecord {
 pub struct CopyPaths<'a> {
     pub source: &'a Path,
     pub staging: &'a Path,
-    pub retarget_from: &'a str,
-    pub retarget_to: &'a str,
+    /// Applied to every security descriptor and junction on the way into
+    /// the copy: the copy belongs to the target account from the start.
+    pub substitution: &'a Substitution,
 }
 
 #[derive(Debug, Default)]
@@ -147,6 +153,9 @@ pub struct CopyOutcome {
     pub cloud_only: Vec<String>,
     /// Relative paths of links that were retargeted.
     pub retargeted: Vec<String>,
+    /// Entries whose security descriptor named the source and now names
+    /// the target.
+    pub translated: usize,
     pub bytes: u64,
 }
 
@@ -200,11 +209,31 @@ pub fn create_root(paths: &CopyPaths, migration_id: &str) -> Result<EntryRecord,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(context(paths.source, err)),
     }
-    let copied = platform::copy_entry(paths.source, paths.staging, true, None)
-        .map_err(|err| context(paths.staging, err))?;
+    let copied = platform::copy_entry(paths.source, paths.staging, true, None, &|sd| {
+        paths.substitution.security_bytes(sd)
+    })
+    .map_err(|err| context(paths.staging, err))?;
     fs::write(paths.staging.join(FOLDER_MARKER_FILE), migration_id)
         .map_err(|err| context(paths.staging, err))?;
     Ok(EntryRecord::new("", CopyClass::Directory, &copied.source))
+}
+
+/// What the copy of an entry must look like: the source's facts with the
+/// security descriptor translated. Also says whether it was translated.
+fn expected(
+    paths: &CopyPaths,
+    relative: &str,
+    class: CopyClass,
+    source: &EntryFacts,
+) -> (EntryRecord, bool) {
+    let mut record = EntryRecord::new(relative, class, source);
+    match paths.substitution.security(&record.security) {
+        Some(translated) => {
+            record.security = translated;
+            (record, true)
+        }
+        None => (record, false),
+    }
 }
 
 /// Copies everything below the root. Stops at the first error: a copy with
@@ -214,10 +243,13 @@ pub fn copy_tree(
     root: EntryRecord,
     manifest: &mut Manifest,
 ) -> Result<CopyOutcome, Box<dyn Error>> {
-    let mut outcome = CopyOutcome {
-        entries: vec![root],
-        ..CopyOutcome::default()
-    };
+    let mut outcome = CopyOutcome::default();
+    let mut root = root;
+    if let Some(translated) = paths.substitution.security(&root.security) {
+        root.security = translated;
+        outcome.translated += 1;
+    }
+    outcome.entries.push(root);
     // Iterative, like the scan: profile trees can be deep.
     let mut pending = vec![String::new()];
     while let Some(dir) = pending.pop() {
@@ -254,9 +286,13 @@ pub fn copy_tree(
                     outcome.cloud_only.push(relative);
                 }
                 CopyClass::Directory | CopyClass::File => {
-                    let copied = platform::copy_entry(&source, &dest, is_dir, None)
-                        .map_err(|err| context(&source, err))?;
-                    let mut record = EntryRecord::new(&relative, class, &copied.source);
+                    let copied = platform::copy_entry(&source, &dest, is_dir, None, &|sd| {
+                        paths.substitution.security_bytes(sd)
+                    })
+                    .map_err(|err| context(&source, err))?;
+                    let (mut record, translated) =
+                        expected(paths, &relative, class, &copied.source);
+                    outcome.translated += usize::from(translated);
                     record.sha256 = copied.sha256;
                     let hash = copied.sha256.map(|h| reparse::hex(&h)).unwrap_or_default();
                     let size = record.size.to_string();
@@ -279,13 +315,20 @@ pub fn copy_tree(
                     let original = link_data.ok_or_else(|| {
                         format!("{}: reparse point without reparse data", source.display())
                     })?;
-                    let rewritten =
-                        reparse::retarget(&original, paths.retarget_from, paths.retarget_to)
-                            .map_err(|err| format!("{}: {err}", source.display()))?;
+                    let rewritten = reparse::retarget(
+                        &original,
+                        &paths.substitution.source_path,
+                        &paths.substitution.target_path,
+                    )
+                    .map_err(|err| format!("{}: {err}", source.display()))?;
                     let data = rewritten.as_deref().unwrap_or(&original);
-                    let copied = platform::copy_entry(&source, &dest, is_dir, Some(data))
-                        .map_err(|err| context(&source, err))?;
-                    let mut record = EntryRecord::new(&relative, class, &copied.source);
+                    let copied = platform::copy_entry(&source, &dest, is_dir, Some(data), &|sd| {
+                        paths.substitution.security_bytes(sd)
+                    })
+                    .map_err(|err| context(&source, err))?;
+                    let (mut record, translated) =
+                        expected(paths, &relative, class, &copied.source);
+                    outcome.translated += usize::from(translated);
                     record.reparse = Some(data.to_vec());
                     let target = reparse::link_target(data)
                         .ok()
@@ -442,7 +485,7 @@ pub fn compare(expected: &[EntryRecord], observed: &[EntryRecord]) -> Vec<String
         if want.reparse != have.reparse {
             problems.push(format!("{name}: link target differs"));
         }
-        if want.security != have.security {
+        if comparable_security(&want.security) != comparable_security(&have.security) {
             problems.push(format!(
                 "{name}: security differs (copy {}, source {})",
                 have.security, want.security
@@ -463,6 +506,17 @@ pub fn compare(expected: &[EntryRecord], observed: &[EntryRecord]) -> Vec<String
         ));
     }
     problems
+}
+
+/// The descriptor as compared. A SACL section without entries is dropped:
+/// an empty SACL and a NULL one (`S:` and `S:NO_ACCESS_CONTROL`) both mean
+/// no auditing and no integrity label, and restoring app execution aliases
+/// turns the first into the second.
+fn comparable_security(sddl: &str) -> &str {
+    match sddl.rfind("S:") {
+        Some(at) if !sddl[at..].contains('(') && !sddl[at..].contains("D:") => &sddl[..at],
+        _ => sddl,
+    }
 }
 
 /// Whether the source entry changed after it was copied, which would make
@@ -632,6 +686,18 @@ mod tests {
         now.written = 2;
         now.size = 5;
         assert!(source_change(&copied, &now).is_some());
+    }
+
+    #[test]
+    fn empty_and_null_sacls_compare_equal_but_labels_do_not() {
+        let mut expected = record("a.exe", CopyClass::Link);
+        expected.security = "O:BAD:(A;;FA;;;SY)S:".into();
+        let mut copy = expected.clone();
+        copy.security = "O:BAD:(A;;FA;;;SY)S:NO_ACCESS_CONTROL".into();
+        assert!(compare(&[expected.clone()], &[copy.clone()]).is_empty());
+
+        copy.security = "O:BAD:(A;;FA;;;SY)S:(ML;OICI;NW;;;LW)".into();
+        assert_eq!(compare(&[expected], &[copy]).len(), 1);
     }
 
     #[test]

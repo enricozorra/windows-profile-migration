@@ -60,14 +60,18 @@ because it contains copies of the user's hives.
 
 ## Working copy
 
-`migrate --stage-only` runs the preflight and, if nothing blocks, copies
-the source profile to `<target folder>.windows-profile-migration-staging`
-and verifies it, then stops. The source keeps working as before.
+`migrate --stage-only` runs the preflight and, if nothing blocks, builds
+the working copy in `<target folder>.windows-profile-migration-staging`,
+moves it to the target account, verifies it, then stops. The source keeps
+working as before.
 
 - Every entry is copied with backup semantics (BackupRead/BackupWrite):
-  data, alternate data streams, extended attributes, owner and DACL,
-  attributes and timestamps. Owners and ACEs still name the source SID;
-  rewriting them is the next phase.
+  data, alternate data streams, extended attributes, security descriptor
+  (integrity labels included), attributes and timestamps.
+- On the way in, the source SID becomes the target SID wherever the
+  descriptor stores a SID: owner, group and every ACE, inherited ones
+  included. The SID is replaced in the binary descriptor, so every other
+  byte (control flags, empty SACLs) stays exactly as it was.
 - Junctions and symbolic links are recreated, never entered. Those that
   point into the source profile (such as the legacy `Application Data`)
   are retargeted to the same place under the target folder.
@@ -78,8 +82,19 @@ and verifies it, then stops. The source keeps working as before.
   every entry with the source: SHA-256 of the content, size, attributes,
   timestamps, security descriptor, streams and link targets. It also
   checks that the source did not change during the copy.
-- If the copy or the verification fails, the copy is removed straight
-  away through `rollback`.
+- The copy's `NTUSER.DAT` and `UsrClass.dat` are mounted (each mount is
+  journaled) and rewritten: key owners and ACEs move to the target SID,
+  and text values (`REG_SZ`, `REG_EXPAND_SZ`, `REG_MULTI_SZ`) that contain
+  the source folder as a whole path, or the source SID, are rewritten.
+  Each hive is then unmounted, mounted again and checked: nothing that
+  should have changed may be left.
+- Left as they are, and listed in the output and the log: binary values
+  that embed the source folder, text that mentions it in a way that is not
+  clearly a path (`C:\Users\Test -flag`), key and value names that contain
+  it, and the UserChoice keys (default apps for http, https and .pdf),
+  which Windows protects; their hash is tied to the account SID, so
+  Windows resets those defaults at the first logon in any case.
+- If any step fails, the copy is removed straight away through `rollback`.
 
 The migration folder holds the journal and `copy-manifest.log`, one record
 per copied or skipped entry.
@@ -142,6 +157,9 @@ src/
   stage.rs          migrate --stage-only: journal, copy, verify, undo on failure
   copy.rs           working copy walk, verification and comparison
   reparse.rs        junction/symlink data and retargeting (pure)
+  rewrite.rs        what changes in the copy: SIDs and paths (pure)
+  secdesc.rs        SID replacement in binary security descriptors (pure)
+  hives.rs          rewrite and re-check of the copy's registry hives
   backup.rs         ProfileList .reg export, hive copies, ACL manifest
   scan.rs           profile walk that never follows reparse points
   sddl.rs sid.rs account.rs os_support.rs profile_state.rs   pure helpers
@@ -152,7 +170,8 @@ scripts/
   vm-validate.ps1           end-to-end checks of preflight/dry-run/backup
   vm-validate-rollback.ps1  simulated interrupted migrations vs status/rollback
   vm-validate-stage.ps1     working copy of a synthetic (and optionally a real)
-                            profile, verification, rollback, failure cleanup
+                            profile: copy, SID and path rewrite, verification,
+                            rollback, failure cleanup
 ```
 
 All decision logic is platform-neutral, so `cargo test` runs on macOS or
@@ -196,10 +215,14 @@ before and after preflight and dry-run. Run it on a disposable snapshot only.
 
 ## Not implemented yet
 
-- Rewriting SIDs and paths in the copy, commit and post-logon checks.
-  `migrate` without `--dry-run` or `--stage-only` is refused.
-- SACLs (audit entries) are not copied: reading them needs
-  SeSecurityPrivilege and profiles rarely have any.
+- Commit (rename the copy, add the target's ProfileList entry) and
+  post-logon checks. `migrate` without `--dry-run` or `--stage-only` is
+  refused.
+- Paths inside files (shortcuts, application configuration) are not
+  rewritten yet.
+- Audit entries in SACLs are not copied: reading them needs
+  SeSecurityPrivilege and profiles rarely have any. Integrity labels are
+  copied.
 - Finalize (retire the source account and profile).
 
 ## Contributing

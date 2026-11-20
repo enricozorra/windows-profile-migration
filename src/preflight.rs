@@ -1163,8 +1163,24 @@ fn check_registry(facts: &SystemFacts) -> Finding {
             inspection.binary_path_refs.len(),
         ));
     }
+    if !inspection.loose_path_refs.is_empty() {
+        details.push(format!(
+            "{} text values mention {old} but not as a whole path, and are left as they are:",
+            inspection.loose_path_refs.len()
+        ));
+        details.extend(with_more(
+            &inspection.loose_path_refs[..inspection
+                .loose_path_refs
+                .len()
+                .min(crate::model::Tally::MAX_SAMPLES)],
+            inspection.loose_path_refs.len(),
+        ));
+    }
     details.extend(inspection.errors.iter().map(|e| format!("not read: {e}")));
-    let severity = if inspection.binary_path_refs.is_empty() && inspection.errors.is_empty() {
+    let severity = if inspection.binary_path_refs.is_empty()
+        && inspection.loose_path_refs.is_empty()
+        && inspection.errors.is_empty()
+    {
         Severity::Info
     } else {
         Severity::Warning

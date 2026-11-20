@@ -38,6 +38,7 @@ use super::token::enable_privilege;
 use super::wide::{from_wide_buf, last_error, path_to_wide_verbatim};
 use crate::copy::COPIED_ATTRIBUTES;
 use crate::model::{CopiedEntry, EntryFacts};
+use crate::secdesc::Edited;
 
 const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
 const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
@@ -71,12 +72,14 @@ pub fn enable_copy_privileges() -> io::Result<()> {
 /// Copies one entry from `source` to the new path `dest`, which must not
 /// exist. `reparse` is the reparse data to give the copy (possibly
 /// retargeted); `None` drops any reparse data, which is how a hydrated
-/// cloud file becomes a plain file.
+/// cloud file becomes a plain file. `edit_security` may rewrite the
+/// binary security descriptor on its way into the copy.
 pub fn copy_entry(
     source: &Path,
     dest: &Path,
     is_dir: bool,
     reparse: Option<&[u8]>,
+    edit_security: &dyn Fn(&[u8]) -> Edited,
 ) -> io::Result<CopiedEntry> {
     // Sharing read access only: nothing can modify the file while it is
     // being copied, and an unexpected writer makes the copy fail rather
@@ -106,7 +109,7 @@ pub fn copy_entry(
         output_options.create_new(true).open(dest)?
     };
 
-    let sha256 = transfer_streams(&input, &output, is_dir, reparse)?;
+    let sha256 = transfer_streams(&input, &output, is_dir, reparse, edit_security)?;
 
     let mut attributes = facts.attributes & COPIED_ATTRIBUTES;
     // Zero would mean "leave unchanged" and keep what creation gave the
@@ -324,13 +327,16 @@ fn set_basic_info(handle: HANDLE, created: i64, written: i64, attributes: u32) -
 /// Moves every stream BackupRead produces for `input` into `output` through
 /// BackupWrite, except object ids (unique per volume), transaction and
 /// property data, and the reparse data, which is replaced by `reparse`.
-/// Returns the SHA-256 of the data stream for files copied as one plain
-/// stream.
+/// The security descriptor passes through `edit_security`; writing it in
+/// the stream, as a restore does, keeps its control flags (protected,
+/// auto-inherited) exactly. Returns the SHA-256 of the data stream for
+/// files copied as one plain stream.
 fn transfer_streams(
     input: &File,
     output: &File,
     is_dir: bool,
     reparse: Option<&[u8]>,
+    edit_security: &dyn Fn(&[u8]) -> Edited,
 ) -> io::Result<Option<[u8; 32]>> {
     let mut reader = BackupStream::new(input.as_raw_handle() as HANDLE, false);
     let mut writer = BackupStream::new(output.as_raw_handle() as HANDLE, true);
@@ -362,11 +368,21 @@ fn transfer_streams(
         }
 
         match id {
-            BACKUP_DATA
-            | BACKUP_EA_DATA
-            | BACKUP_SECURITY_DATA
-            | BACKUP_ALTERNATE_DATA
-            | BACKUP_SPARSE_BLOCK => {
+            BACKUP_SECURITY_DATA => {
+                let mut descriptor = vec![0u8; size as usize];
+                if reader.read_full(&mut descriptor)? != descriptor.len() {
+                    return Err(io::Error::other("BackupRead ended inside a stream"));
+                }
+                if let Some(edited) = edit_security(&descriptor).map_err(io::Error::other)? {
+                    descriptor = edited;
+                }
+                let mut replaced = header;
+                replaced[8..16].copy_from_slice(&(descriptor.len() as u64).to_le_bytes());
+                writer.write_all(&replaced)?;
+                writer.write_all(&name)?;
+                writer.write_all(&descriptor)?;
+            }
+            BACKUP_DATA | BACKUP_EA_DATA | BACKUP_ALTERNATE_DATA | BACKUP_SPARSE_BLOCK => {
                 let sparse = id == BACKUP_SPARSE_BLOCK
                     || (id == BACKUP_DATA && stream_attributes & STREAM_SPARSE_ATTRIBUTE != 0);
                 if sparse {

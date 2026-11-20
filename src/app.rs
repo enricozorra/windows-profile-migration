@@ -277,6 +277,7 @@ fn log_facts(facts: &SystemFacts, log: &mut Logger) -> Result<(), Box<dyn Error>
             // console only samples.
             for (kind, refs) in [
                 ("text", &inspection.text_path_refs),
+                ("loose", &inspection.loose_path_refs),
                 ("binary", &inspection.binary_path_refs),
             ] {
                 for location in refs {

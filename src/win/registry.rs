@@ -43,7 +43,15 @@ pub enum RegValue {
     Other,
 }
 
-pub struct RegKey(HKEY);
+pub struct RegKey(pub(super) HKEY);
+
+/// A value as stored. The name stays UTF-16 so the value can be written
+/// back under exactly its name.
+pub struct RawValue {
+    pub name: Vec<u16>,
+    pub kind: u32,
+    pub data: Vec<u8>,
+}
 
 impl Drop for RegKey {
     fn drop(&mut self) {
@@ -93,6 +101,18 @@ impl RegKey {
 
     /// Calls `visit(name, data)` for every value of this key.
     fn for_each_value(&self, visit: &mut dyn FnMut(&str, RegData)) -> io::Result<()> {
+        for value in self.raw_values()? {
+            visit(
+                &String::from_utf16_lossy(&value.name),
+                decode_data(value.kind, &value.data),
+            );
+        }
+        Ok(())
+    }
+
+    /// Every value of this key as stored.
+    pub(super) fn raw_values(&self) -> io::Result<Vec<RawValue>> {
+        let mut values = Vec::new();
         let mut name = vec![0u16; MAX_VALUE_NAME];
         let mut data: Vec<u8> = vec![0; 4096];
         let mut index = 0u32;
@@ -116,14 +136,17 @@ impl RegKey {
             };
             match status {
                 0 => {
-                    let value_name = from_wide_buf(&name[..name_len as usize]);
-                    visit(&value_name, decode_data(kind, &data[..data_len as usize]));
+                    values.push(RawValue {
+                        name: name[..name_len as usize].to_vec(),
+                        kind,
+                        data: data[..data_len as usize].to_vec(),
+                    });
                     index += 1;
                 }
                 // The name buffer is already the maximum size, so only the
                 // data can be too small: grow it and retry the same index.
                 ERROR_MORE_DATA => data.resize(data_len as usize, 0),
-                ERROR_NO_MORE_ITEMS => return Ok(()),
+                ERROR_NO_MORE_ITEMS => return Ok(values),
                 code => return Err(win32_error("RegEnumValueW", code)),
             }
         }
@@ -202,13 +225,13 @@ impl RegKey {
     }
 }
 
-fn utf16_units(data: &[u8]) -> Vec<u16> {
+pub(super) fn utf16_units(data: &[u8]) -> Vec<u16> {
     data.chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect()
 }
 
-fn decode_data(kind: u32, data: &[u8]) -> RegData {
+pub(super) fn decode_data(kind: u32, data: &[u8]) -> RegData {
     match kind {
         REG_SZ | REG_EXPAND_SZ => RegData::Text(from_wide_buf(&utf16_units(data))),
         REG_MULTI_SZ => RegData::MultiText(
