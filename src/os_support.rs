@@ -60,6 +60,19 @@ pub fn classify(os: &OsVersion) -> OsSupport {
     }
 }
 
+/// Windows 11 still reports "Windows 10 ..." in the registry ProductName,
+/// so the first Windows 11 build decides which name is shown.
+#[cfg_attr(not(windows), allow(dead_code))]
+const FIRST_WINDOWS_11_BUILD: u32 = 22000;
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn product_name_for_build(registry_product_name: &str, build: u32) -> String {
+    match registry_product_name.strip_prefix("Windows 10") {
+        Some(edition) if build >= FIRST_WINDOWS_11_BUILD => format!("Windows 11{edition}"),
+        _ => registry_product_name.to_string(),
+    }
+}
+
 pub fn validated_build_list() -> String {
     VALIDATED_BUILDS
         .iter()
@@ -112,6 +125,30 @@ mod tests {
             classify(&os(22621, "Client")),
             OsSupport::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn product_name_is_corrected_on_windows_11_builds() {
+        assert_eq!(
+            product_name_for_build("Windows 10 Pro", 26100),
+            "Windows 11 Pro"
+        );
+        assert_eq!(
+            product_name_for_build("Windows 10 Enterprise", 22000),
+            "Windows 11 Enterprise"
+        );
+    }
+
+    #[test]
+    fn product_name_is_kept_on_windows_10_and_other_names() {
+        assert_eq!(
+            product_name_for_build("Windows 10 Pro", 19045),
+            "Windows 10 Pro"
+        );
+        assert_eq!(
+            product_name_for_build("Windows 11 Pro", 26100),
+            "Windows 11 Pro"
+        );
     }
 
     #[test]

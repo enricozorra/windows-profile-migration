@@ -14,6 +14,7 @@ use windows_sys::Win32::System::SystemInformation::{ComputerNameNetBIOS, GetComp
 use super::registry::{RegKey, RegValue};
 use super::wide::{from_wide_buf, from_wide_ptr, last_error, to_wide, win32_error};
 use crate::model::{DomainMembership, OsVersion};
+use crate::os_support;
 
 const CURRENT_VERSION_KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
 
@@ -80,9 +81,7 @@ pub fn os_version() -> io::Result<OsVersion> {
         _ => 0,
     };
     Ok(OsVersion {
-        // ProductName still says "Windows 10" on Windows 11; the build
-        // number is what os_support keys on.
-        product_name: string("ProductName")?,
+        product_name: os_support::product_name_for_build(&string("ProductName")?, build),
         display_version: string("DisplayVersion")?,
         installation_type: string("InstallationType")?,
         build,
