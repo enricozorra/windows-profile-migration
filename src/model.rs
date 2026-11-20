@@ -17,6 +17,9 @@ pub const APPX_USER_STORE_KEY: &str =
 pub const MIGRATION_MARKER_VALUE: &str = "WindowsProfileMigrationSourceSid";
 /// Prefix of the temporary HKU mount names the execution phase will use.
 pub const HIVE_MOUNT_PREFIX: &str = "windows-profile-migration_";
+/// Suffix of the working copy built next to the final target folder. A
+/// leftover one means an earlier run stopped before its commit.
+pub const STAGING_SUFFIX: &str = ".windows-profile-migration-staging";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenInfo {
@@ -238,6 +241,8 @@ pub struct SkippedEntry {
 pub struct ProfileScan {
     pub directories: usize,
     pub files: usize,
+    /// Total size of the regular files, i.e. what the copy has to write.
+    pub file_bytes: u64,
     pub reparse_points: Tally,
     pub cloud_placeholders: Tally,
     pub encrypted: Tally,
@@ -265,6 +270,68 @@ pub struct KnownPaths {
     pub errors: Vec<String>,
 }
 
+/// Where the migrated profile will live, and whether that is still free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetDirFacts {
+    /// Folder name under the profiles directory (the target account name).
+    pub folder_name: String,
+    pub path: PathBuf,
+    pub exists: bool,
+    pub staging_path: PathBuf,
+    pub staging_exists: bool,
+}
+
+/// Registry data in a platform-neutral shape, as handed to the inspector.
+// Some variants are only constructed by the Windows platform layer.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegData {
+    Text(String),
+    MultiText(Vec<String>),
+    Binary(Vec<u8>),
+    Other,
+}
+
+/// What a read-only walk of the source user's registry found.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RegistryInspection {
+    /// "live" (hive mounted because the user is logged on) or
+    /// "private copy" (an app-hive load of a copy, never the original).
+    pub method: String,
+    pub values_scanned: usize,
+    /// Every text value that contains the old profile path, as
+    /// `HIVE\key\value`. Complete, so the log lists all of them.
+    pub text_path_refs: Vec<String>,
+    /// Binary values that embed the old path as UTF-16 or ANSI text.
+    pub binary_path_refs: Vec<String>,
+    /// `Z: -> \\server\share`.
+    pub network_drives: Vec<String>,
+    pub printer_connections: Vec<String>,
+    pub outlook_profiles: Vec<String>,
+    /// .pst/.ost paths found in the Outlook profile data.
+    pub outlook_data_files: Vec<String>,
+    /// `Business1 -> C:\Users\x\OneDrive - Contoso`.
+    pub onedrive_accounts: Vec<String>,
+    /// Keys that could not be read; the walk continued past them.
+    pub errors: Vec<String>,
+}
+
+/// Local group memberships of both accounts on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalGroups {
+    pub source: Result<Vec<String>, String>,
+    pub target: Result<Vec<String>, String>,
+}
+
+/// Things outside the profile that run as the source account and would
+/// stop working once it is retired.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AccountReferences {
+    pub services: Vec<String>,
+    pub scheduled_tasks: Vec<String>,
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemFacts {
     pub token: TokenInfo,
@@ -281,6 +348,17 @@ pub struct SystemFacts {
     pub profile_dir: Option<ProfileDirFacts>,
     pub known_paths: Option<KnownPaths>,
     pub scan: Option<ProfileScan>,
+    /// None when the target account or the profiles directory is unknown.
+    pub target_dir: Option<TargetDirFacts>,
+    /// Free bytes on the volume that holds the profiles directory.
+    pub free_bytes: Option<Result<u64, String>>,
+    /// None when the source hive could not be located; Err when it could
+    /// not be read at all.
+    pub registry: Option<Result<RegistryInspection, String>>,
+    pub local_groups: Option<LocalGroups>,
+    pub account_references: Option<AccountReferences>,
+    /// Applications from the catalog that were found in the profile.
+    pub apps: Vec<crate::apps::AppReport>,
 }
 
 impl SystemFacts {

@@ -9,9 +9,11 @@
 
 mod account;
 mod app;
+mod apps;
 mod backup;
 mod cli;
 mod facts;
+mod hive_scan;
 mod json;
 mod log;
 mod model;
@@ -20,6 +22,7 @@ mod plan;
 mod platform;
 mod preflight;
 mod profile_state;
+mod references;
 mod report;
 mod scan;
 mod sddl;

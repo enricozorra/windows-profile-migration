@@ -4,6 +4,7 @@
 //! Every check reports, including passes, so the summary shows what was
 //! verified and not only what failed. Nothing here touches the system.
 
+use crate::apps::AppReport;
 use crate::model::{
     AccountInput, AccountKind, DomainMembership, LockState, LookupOutcome, ProfileListEntry,
     SidValue, SystemFacts, HIVE_MOUNT_PREFIX,
@@ -48,10 +49,18 @@ pub mod ids {
     pub const REPARSE_POINTS: &str = "REPARSE_POINTS";
     pub const CLOUD_PLACEHOLDERS: &str = "CLOUD_PLACEHOLDERS";
     pub const DPAPI_SECRETS: &str = "DPAPI_SECRETS";
-    pub const ONEDRIVE: &str = "ONEDRIVE";
     pub const APPX_STATE: &str = "APPX_STATE";
     pub const KNOWN_PATHS: &str = "KNOWN_PATHS";
+    pub const TARGET_FOLDER: &str = "TARGET_FOLDER";
+    pub const DISK_SPACE: &str = "DISK_SPACE";
+    pub const REGISTRY_PATHS: &str = "REGISTRY_PATHS";
+    pub const LOCAL_GROUPS: &str = "LOCAL_GROUPS";
+    pub const ACCOUNT_REFERENCES: &str = "ACCOUNT_REFERENCES";
 }
+
+/// Headroom on top of the profile size: NTFS metadata for the copied tree,
+/// the hive copies and anything the user writes while the copy runs.
+pub const COPY_MARGIN_BYTES: u64 = 1 << 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -155,9 +164,15 @@ pub fn evaluate(facts: &SystemFacts, options: &Options) -> Report {
         check_profile_directory(facts),
         check_loaded_hives(facts),
         check_hive_files(facts),
+        check_target_folder(facts),
+        check_disk_space(facts),
     ];
     findings.extend(check_scan(facts));
+    findings.push(check_registry(facts));
+    findings.push(check_local_groups(facts));
+    findings.push(check_account_references(facts));
     findings.extend(check_known_paths(facts));
+    findings.extend(facts.apps.iter().map(app_finding));
 
     for finding in &mut findings {
         if finding.severity == Severity::Blocking
@@ -922,7 +937,7 @@ fn check_scan(facts: &SystemFacts) -> Vec<Finding> {
             ids::REPARSE_POINTS,
             Severity::Info,
             format!(
-                "{} junctions/symlinks will be skipped, never traversed",
+                "{} junctions/symlinks are not traversed; the copy recreates them pointing into the new folder",
                 scan.reparse_points.count
             ),
         )
@@ -938,7 +953,7 @@ fn check_scan(facts: &SystemFacts) -> Vec<Finding> {
                 ids::CLOUD_PLACEHOLDERS,
                 Severity::Warning,
                 format!(
-                    "{} cloud placeholders (not fully local); they are not traversed and stay bound to the sync account",
+                    "{} cloud placeholders (online-only files) are not copied, which would download them; they reappear after OneDrive sign-in",
                     scan.cloud_placeholders.count
                 ),
             )
@@ -962,7 +977,7 @@ fn check_known_paths(facts: &SystemFacts) -> Vec<Finding> {
             Finding::new(
                 ids::KNOWN_PATHS,
                 Severity::Warning,
-                "some caveat locations could not be read; the DPAPI/OneDrive/AppX checks below may be incomplete",
+                "some caveat locations could not be read; the DPAPI/AppX/application checks may be incomplete",
             )
             .with_details(known.errors.clone()),
         );
@@ -987,29 +1002,6 @@ fn check_known_paths(facts: &SystemFacts) -> Vec<Finding> {
         );
     }
 
-    if !known.onedrive_folders.is_empty() || known.onedrive_client_state {
-        let mut details: Vec<String> = known
-            .onedrive_folders
-            .iter()
-            .map(|f| format!("folder: {f}"))
-            .collect();
-        if known.onedrive_client_state {
-            details.push("OneDrive client state in AppData\\Local\\Microsoft\\OneDrive".into());
-        }
-        details.push(
-            "unlink OneDrive and disable Known Folder Move before migrating, then sign in as the target"
-                .into(),
-        );
-        findings.push(
-            Finding::new(
-                ids::ONEDRIVE,
-                Severity::Warning,
-                "OneDrive sync is bound to the source account",
-            )
-            .with_details(details),
-        );
-    }
-
     if facts.appx_store_present || known.appx_package_dirs > 0 {
         findings.push(
             Finding::new(
@@ -1028,6 +1020,300 @@ fn check_known_paths(facts: &SystemFacts) -> Vec<Finding> {
         );
     }
     findings
+}
+
+fn check_target_folder(facts: &SystemFacts) -> Finding {
+    let Some(dir) = &facts.target_dir else {
+        return Finding::new(
+            ids::TARGET_FOLDER,
+            Severity::Info,
+            "not evaluated: target account or profiles directory unknown",
+        );
+    };
+    let path = dir.path.display().to_string();
+    if dir.staging_exists {
+        return Finding::new(
+            ids::TARGET_FOLDER,
+            Severity::Blocking,
+            format!(
+                "a working copy from an earlier run exists: {}",
+                dir.staging_path.display()
+            ),
+        )
+        .with_details(vec![
+            "an earlier migration stopped before its commit; roll it back before retrying".into(),
+        ]);
+    }
+    let claimed_by: Vec<String> = facts
+        .profile_list
+        .entries
+        .iter()
+        .filter(|e| {
+            e.profile_image_path_expanded
+                .as_deref()
+                .is_some_and(|p| same_path(p, &path))
+        })
+        .map(|e| e.key_name.clone())
+        .collect();
+    if dir.exists || !claimed_by.is_empty() {
+        let mut details = claimed_by
+            .into_iter()
+            .map(|k| format!("used by ProfileList entry {k}"))
+            .collect::<Vec<_>>();
+        details.push(
+            "remove or rename it first; the migration never merges into an existing folder".into(),
+        );
+        return Finding::new(
+            ids::TARGET_FOLDER,
+            Severity::Blocking,
+            format!("{path} is already taken"),
+        )
+        .with_details(details);
+    }
+    Finding::new(
+        ids::TARGET_FOLDER,
+        Severity::Pass,
+        format!("the migrated profile will be created at {path}"),
+    )
+}
+
+fn check_disk_space(facts: &SystemFacts) -> Finding {
+    let (Some(free), Some(scan)) = (&facts.free_bytes, &facts.scan) else {
+        return Finding::new(
+            ids::DISK_SPACE,
+            Severity::Info,
+            "not evaluated: profile not scanned",
+        );
+    };
+    let free = match free {
+        Ok(free) => *free,
+        Err(reason) => {
+            return Finding::new(
+                ids::DISK_SPACE,
+                Severity::Blocking,
+                format!("could not read the free disk space: {reason}"),
+            )
+        }
+    };
+    let required = scan.file_bytes + scan.file_bytes / 10 + COPY_MARGIN_BYTES;
+    let summary = format!(
+        "{} free, the copy needs {} ({} of files + 10% + {})",
+        format_bytes(free),
+        format_bytes(required),
+        format_bytes(scan.file_bytes),
+        format_bytes(COPY_MARGIN_BYTES)
+    );
+    if free < required {
+        Finding::new(ids::DISK_SPACE, Severity::Blocking, summary).with_details(vec![
+            "the source profile is kept until the migration is finalized, so both must fit".into(),
+        ])
+    } else {
+        Finding::new(ids::DISK_SPACE, Severity::Pass, summary)
+    }
+}
+
+fn check_registry(facts: &SystemFacts) -> Finding {
+    let inspection = match &facts.registry {
+        None => {
+            return Finding::new(
+                ids::REGISTRY_PATHS,
+                Severity::Info,
+                "not evaluated: source profile path unknown",
+            )
+        }
+        Some(Err(reason)) => {
+            return Finding::new(
+                ids::REGISTRY_PATHS,
+                Severity::Warning,
+                format!("the source registry could not be inspected: {reason}"),
+            )
+            .with_details(vec![
+                "path references and application settings below are incomplete".into(),
+            ])
+        }
+        Some(Ok(inspection)) => inspection,
+    };
+    let old = facts
+        .profile_dir
+        .as_ref()
+        .map(|d| d.path.display().to_string())
+        .unwrap_or_default();
+    let new = facts
+        .target_dir
+        .as_ref()
+        .map(|d| d.path.display().to_string())
+        .unwrap_or_else(|| "the new folder".into());
+    let mut details = with_more(
+        &inspection.text_path_refs[..inspection
+            .text_path_refs
+            .len()
+            .min(crate::model::Tally::MAX_SAMPLES)],
+        inspection.text_path_refs.len(),
+    );
+    if !inspection.binary_path_refs.is_empty() {
+        details.push(format!(
+            "{} binary values embed {old} and are not rewritten automatically:",
+            inspection.binary_path_refs.len()
+        ));
+        details.extend(with_more(
+            &inspection.binary_path_refs[..inspection
+                .binary_path_refs
+                .len()
+                .min(crate::model::Tally::MAX_SAMPLES)],
+            inspection.binary_path_refs.len(),
+        ));
+    }
+    details.extend(inspection.errors.iter().map(|e| format!("not read: {e}")));
+    let severity = if inspection.binary_path_refs.is_empty() && inspection.errors.is_empty() {
+        Severity::Info
+    } else {
+        Severity::Warning
+    };
+    Finding::new(
+        ids::REGISTRY_PATHS,
+        severity,
+        format!(
+            "{} registry values read ({}): {} text values contain {old} and will be rewritten to {new}",
+            inspection.values_scanned,
+            inspection.method,
+            inspection.text_path_refs.len()
+        ),
+    )
+    .with_details(details)
+}
+
+fn check_local_groups(facts: &SystemFacts) -> Finding {
+    let Some(groups) = &facts.local_groups else {
+        return Finding::new(
+            ids::LOCAL_GROUPS,
+            Severity::Info,
+            "not evaluated: source or target unresolved",
+        );
+    };
+    let (source, target) = match (&groups.source, &groups.target) {
+        (Ok(source), Ok(target)) => (source, target),
+        (source, target) => {
+            let details = [("source", source), ("target", target)]
+                .into_iter()
+                .filter_map(|(role, result)| result.as_ref().err().map(|e| format!("{role}: {e}")))
+                .collect();
+            return Finding::new(
+                ids::LOCAL_GROUPS,
+                Severity::Warning,
+                "local group memberships could not be compared",
+            )
+            .with_details(details);
+        }
+    };
+    let missing: Vec<&String> = source
+        .iter()
+        .filter(|g| !target.iter().any(|t| t.eq_ignore_ascii_case(g)))
+        .collect();
+    let target_name = facts
+        .target
+        .account()
+        .map(|a| a.qualified_name())
+        .unwrap_or_else(|| "the target".into());
+    if missing.is_empty() {
+        return Finding::new(
+            ids::LOCAL_GROUPS,
+            Severity::Pass,
+            format!(
+                "the target already has the source's local groups ({})",
+                source.join(", ")
+            ),
+        );
+    }
+    Finding::new(
+        ids::LOCAL_GROUPS,
+        Severity::Warning,
+        format!(
+            "the target is not in all of the source's local groups: {}",
+            missing
+                .iter()
+                .map(|g| g.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
+    .with_details(
+        missing
+            .iter()
+            .map(|g| {
+                format!(
+                    "add {target_name} to {g} if the user still needs it (not done automatically)"
+                )
+            })
+            .collect(),
+    )
+}
+
+fn check_account_references(facts: &SystemFacts) -> Finding {
+    let Some(refs) = &facts.account_references else {
+        return Finding::new(
+            ids::ACCOUNT_REFERENCES,
+            Severity::Info,
+            "not evaluated: source account unresolved",
+        );
+    };
+    if refs.services.is_empty() && refs.scheduled_tasks.is_empty() && refs.errors.is_empty() {
+        return Finding::new(
+            ids::ACCOUNT_REFERENCES,
+            Severity::Pass,
+            "no services or scheduled tasks run as the source account",
+        );
+    }
+    let mut details: Vec<String> = refs
+        .services
+        .iter()
+        .map(|s| format!("service: {s}"))
+        .collect();
+    details.extend(
+        refs.scheduled_tasks
+            .iter()
+            .map(|t| format!("scheduled task: {t}")),
+    );
+    details.extend(refs.errors.iter().map(|e| format!("not read: {e}")));
+    Finding::new(
+        ids::ACCOUNT_REFERENCES,
+        Severity::Warning,
+        format!(
+            "{} service(s) and {} scheduled task(s) run as the source account; reconfigure them for the target",
+            refs.services.len(),
+            refs.scheduled_tasks.len()
+        ),
+    )
+    .with_details(details)
+}
+
+fn app_finding(app: &AppReport) -> Finding {
+    let severity = if app.actions.is_empty() {
+        Severity::Info
+    } else {
+        Severity::Warning
+    };
+    let mut details: Vec<String> = app
+        .carried
+        .iter()
+        .map(|c| format!("carried: {c}"))
+        .collect();
+    details.extend(app.actions.iter().map(|a| format!("action: {a}")));
+    Finding::new(app.id, severity, format!("{} detected", app.name)).with_details(details)
+}
+
+/// Binary (1024-based) size with one decimal, for the console report.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 fn with_more(samples: &[String], count: usize) -> Vec<String> {
@@ -1149,12 +1435,33 @@ mod tests {
             scan: Some(ProfileScan {
                 directories: 10,
                 files: 40,
+                file_bytes: 5 << 30,
                 owned_by_source: Tally {
                     count: 50,
                     samples: vec![],
                 },
                 ..ProfileScan::default()
             }),
+            target_dir: Some(TargetDirFacts {
+                folder_name: "jdoe.new".into(),
+                path: PathBuf::from(r"C:\Users\jdoe.new"),
+                exists: false,
+                staging_path: PathBuf::from(format!(r"C:\Users\jdoe.new{STAGING_SUFFIX}")),
+                staging_exists: false,
+            }),
+            free_bytes: Some(Ok(100 << 30)),
+            registry: Some(Ok(RegistryInspection {
+                method: "private copy".into(),
+                values_scanned: 1000,
+                text_path_refs: vec![r"HKCU\Software\App\Dir".into()],
+                ..RegistryInspection::default()
+            })),
+            local_groups: Some(LocalGroups {
+                source: Ok(vec!["Users".into()]),
+                target: Ok(vec!["Users".into()]),
+            }),
+            account_references: Some(AccountReferences::default()),
+            apps: vec![],
         }
     }
 
@@ -1586,20 +1893,153 @@ mod tests {
     }
 
     #[test]
-    fn dpapi_onedrive_and_appx_warn() {
+    fn dpapi_and_appx_warn() {
         let mut facts = clean_facts();
         facts.known_paths = Some(KnownPaths {
             dpapi_master_keys: true,
             credential_files: 2,
-            onedrive_folders: vec!["OneDrive - Contoso".into()],
-            onedrive_client_state: true,
             appx_package_dirs: 80,
-            errors: vec![],
+            ..KnownPaths::default()
         });
         facts.appx_store_present = true;
-        for id in [ids::DPAPI_SECRETS, ids::ONEDRIVE, ids::APPX_STATE] {
+        for id in [ids::DPAPI_SECRETS, ids::APPX_STATE] {
             assert_eq!(severity_of(&facts, id), Severity::Warning, "{id}");
         }
+    }
+
+    #[test]
+    fn existing_target_folder_is_blocked() {
+        let mut facts = clean_facts();
+        facts.target_dir.as_mut().unwrap().exists = true;
+        assert_eq!(severity_of(&facts, ids::TARGET_FOLDER), Severity::Blocking);
+    }
+
+    #[test]
+    fn target_folder_claimed_by_another_profile_is_blocked() {
+        let mut facts = clean_facts();
+        facts
+            .profile_list
+            .entries
+            .push(entry("S-1-5-21-9-9-9-1001", r"C:\Users\JDOE.NEW"));
+        let report = evaluate(&facts, &Options::default());
+        let finding = finding(&report, ids::TARGET_FOLDER);
+        assert_eq!(finding.severity, Severity::Blocking);
+        assert!(finding.details[0].contains("S-1-5-21-9-9-9-1001"));
+    }
+
+    #[test]
+    fn leftover_staging_copy_is_blocked() {
+        let mut facts = clean_facts();
+        facts.target_dir.as_mut().unwrap().staging_exists = true;
+        let report = evaluate(&facts, &Options::default());
+        let finding = finding(&report, ids::TARGET_FOLDER);
+        assert_eq!(finding.severity, Severity::Blocking);
+        assert!(finding.summary.contains(STAGING_SUFFIX));
+    }
+
+    #[test]
+    fn insufficient_disk_space_is_blocked() {
+        let mut facts = clean_facts();
+        // 5 GB of files + 10% + 1 GB margin = 6.5 GB needed.
+        facts.free_bytes = Some(Ok(6 << 30));
+        assert_eq!(severity_of(&facts, ids::DISK_SPACE), Severity::Blocking);
+        facts.free_bytes = Some(Ok(7 << 30));
+        assert_eq!(severity_of(&facts, ids::DISK_SPACE), Severity::Pass);
+        facts.free_bytes = Some(Err("access denied".into()));
+        assert_eq!(severity_of(&facts, ids::DISK_SPACE), Severity::Blocking);
+    }
+
+    #[test]
+    fn registry_text_paths_are_info_but_binary_paths_warn() {
+        let mut facts = clean_facts();
+        let report = evaluate(&facts, &Options::default());
+        let finding = finding(&report, ids::REGISTRY_PATHS);
+        assert_eq!(finding.severity, Severity::Info);
+        assert!(finding.summary.contains("1 text values"));
+        assert!(finding.summary.contains(r"C:\Users\jdoe.new"));
+
+        if let Some(Ok(inspection)) = facts.registry.as_mut() {
+            inspection
+                .binary_path_refs
+                .push(r"HKCU\Software\Mru\0".into());
+        }
+        assert_eq!(severity_of(&facts, ids::REGISTRY_PATHS), Severity::Warning);
+        facts.registry = Some(Err("copy failed".into()));
+        assert_eq!(severity_of(&facts, ids::REGISTRY_PATHS), Severity::Warning);
+    }
+
+    #[test]
+    fn missing_local_group_warns_with_the_fix() {
+        let mut facts = clean_facts();
+        facts.local_groups = Some(LocalGroups {
+            source: Ok(vec!["Administrators".into(), "Users".into()]),
+            target: Ok(vec!["users".into()]),
+        });
+        let report = evaluate(&facts, &Options::default());
+        let finding = finding(&report, ids::LOCAL_GROUPS);
+        assert_eq!(finding.severity, Severity::Warning);
+        assert_eq!(
+            finding.details,
+            vec![r"add CORP\jdoe to Administrators if the user still needs it (not done automatically)".to_string()]
+        );
+    }
+
+    #[test]
+    fn unreadable_local_groups_warn() {
+        let mut facts = clean_facts();
+        facts.local_groups = Some(LocalGroups {
+            source: Ok(vec![]),
+            target: Err("domain controller unreachable".into()),
+        });
+        let report = evaluate(&facts, &Options::default());
+        let finding = finding(&report, ids::LOCAL_GROUPS);
+        assert_eq!(finding.severity, Severity::Warning);
+        assert_eq!(
+            finding.details,
+            vec!["target: domain controller unreachable".to_string()]
+        );
+    }
+
+    #[test]
+    fn services_and_tasks_running_as_source_warn() {
+        let mut facts = clean_facts();
+        facts.account_references = Some(AccountReferences {
+            services: vec!["Backup Agent".into()],
+            scheduled_tasks: vec![r"\Sync".into()],
+            errors: vec![],
+        });
+        let report = evaluate(&facts, &Options::default());
+        let finding = finding(&report, ids::ACCOUNT_REFERENCES);
+        assert_eq!(finding.severity, Severity::Warning);
+        assert_eq!(finding.details.len(), 2);
+    }
+
+    #[test]
+    fn apps_warn_only_when_an_action_is_needed() {
+        let mut facts = clean_facts();
+        facts.apps = vec![
+            AppReport {
+                id: "APP_PRINTERS",
+                name: "Network printer connections",
+                carried: vec![r"\\srv\HP".into()],
+                actions: vec![],
+            },
+            AppReport {
+                id: "APP_TEAMS",
+                name: "Microsoft Teams",
+                carried: vec![],
+                actions: vec!["sign in again".into()],
+            },
+        ];
+        assert_eq!(severity_of(&facts, "APP_PRINTERS"), Severity::Info);
+        assert_eq!(severity_of(&facts, "APP_TEAMS"), Severity::Warning);
+    }
+
+    #[test]
+    fn bytes_are_formatted_in_binary_units() {
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(5 << 30), "5.0 GB");
     }
 
     #[test]

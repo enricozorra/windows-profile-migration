@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 
-use super::wide::{from_wide_buf, last_error};
+use super::wide::{from_wide_buf, last_error, to_wide};
 use crate::model::LockState;
 
 pub fn file_attributes(metadata: &Metadata) -> u32 {
@@ -32,6 +33,29 @@ pub fn probe_exclusive(path: &Path) -> LockState {
         }
         Err(err) => LockState::Error(err.to_string()),
     }
+}
+
+/// Bytes available to the caller on the volume that holds `path` (which
+/// honors quotas, unlike the volume total).
+pub fn free_bytes(path: &Path) -> io::Result<u64> {
+    let wide = to_wide(&path.display().to_string());
+    let mut available = 0u64;
+    // SAFETY: NUL-terminated directory; the two totals we do not need are null.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(last_error(&format!(
+            "GetDiskFreeSpaceExW({})",
+            path.display()
+        )));
+    }
+    Ok(available)
 }
 
 /// `reg.exe export HKLM\<subkey> <dest> /y`. Uses the absolute System32

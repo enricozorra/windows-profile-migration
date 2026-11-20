@@ -1,29 +1,35 @@
-//! Dry-run plan: the exact mutations the execution phase would perform,
+//! Dry-run plan: the exact steps the execution phase would perform,
 //! derived only from gathered facts. Building a plan writes nothing.
 //!
-//! Hives are deliberately not mounted in dry-run: RegLoadKey replays a
-//! hive's transaction logs into the file, so even a "read-only" mount can
-//! modify NTUSER.DAT. Hive changes are therefore described, not counted.
+//! The migration never modifies the source profile. It builds a working
+//! copy next to the final folder, rewrites SIDs and paths in the copy only,
+//! verifies it, and commits by renaming the copy and adding the target's
+//! ProfileList entry. Until the operator finalizes, rolling back means
+//! deleting the copy and that entry; the source account keeps working.
 
 use crate::model::{
-    ProfileListEntry, SystemFacts, HIVE_MOUNT_PREFIX, MIGRATION_MARKER_VALUE, PROFILE_GUID_KEY,
-    PROFILE_LIST_KEY,
+    ProfileListEntry, SystemFacts, TargetDirFacts, MIGRATION_MARKER_VALUE, PROFILE_LIST_KEY,
 };
+use crate::preflight::format_bytes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Area {
-    Registry,
-    Hive,
-    FileSystem,
+    Copy,
+    Rewrite,
+    Verify,
+    Commit,
+    Unchanged,
     FollowUp,
 }
 
 impl Area {
     pub fn label(self) -> &'static str {
         match self {
-            Area::Registry => "registry",
-            Area::Hive => "hive",
-            Area::FileSystem => "filesystem",
+            Area::Copy => "copy",
+            Area::Rewrite => "rewrite",
+            Area::Verify => "verify",
+            Area::Commit => "commit",
+            Area::Unchanged => "unchanged",
             Area::FollowUp => "follow-up",
         }
     }
@@ -32,8 +38,8 @@ impl Area {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Create,
-    Remove,
     Modify,
+    Check,
     Skip,
     Manual,
 }
@@ -42,8 +48,8 @@ impl Op {
     pub fn symbol(self) -> char {
         match self {
             Op::Create => '+',
-            Op::Remove => '-',
             Op::Modify => '~',
+            Op::Check => '?',
             Op::Skip => '=',
             Op::Manual => '!',
         }
@@ -58,169 +64,246 @@ pub struct PlannedChange {
     pub lines: Vec<String>,
 }
 
-/// Builds the plan. Returns an empty plan with a single note when the
-/// prerequisites (both SIDs and the source entry) are missing.
+/// Builds the plan. Returns a single note when the prerequisites (both
+/// SIDs, the source entry and the target folder) are missing.
 pub fn build(facts: &SystemFacts) -> Vec<PlannedChange> {
-    let (Some(source_sid), Some(target_sid), Some(entry)) =
-        (facts.source.sid(), facts.target.sid(), facts.source_entry())
-    else {
+    let (Some(source_sid), Some(target_sid), Some(entry), Some(dir), Some(source_root)) = (
+        facts.source.sid(),
+        facts.target.sid(),
+        facts.source_entry(),
+        facts.target_dir.as_ref(),
+        facts.profile_dir.as_ref(),
+    ) else {
         return vec![PlannedChange {
-            area: Area::Registry,
+            area: Area::FollowUp,
             op: Op::Manual,
             target: "plan".into(),
             lines: vec![
-                "cannot plan: source/target SID or source ProfileList entry is unknown".into(),
+                "cannot plan: source/target SID, source ProfileList entry or target folder is unknown"
+                    .into(),
             ],
         }];
     };
+    let source = source_root.path.display().to_string();
+    let staging = dir.staging_path.display().to_string();
+    let target = dir.path.display().to_string();
 
-    let mut plan = vec![
-        target_entry(entry, source_sid, target_sid),
-        PlannedChange {
-            area: Area::Registry,
-            op: Op::Remove,
-            target: format!("HKLM\\{PROFILE_LIST_KEY}\\{source_sid}"),
-            lines: vec![
-                "removed only after the target entry and hives are verified".into(),
-                "restorable from ProfileList.reg in the backup".into(),
-            ],
-        },
-    ];
-    if let Some(guid) = &entry.guid {
-        plan.push(PlannedChange {
-            area: Area::Registry,
-            op: Op::Remove,
-            target: format!("HKLM\\{PROFILE_GUID_KEY}\\{guid}"),
-            lines: vec![
-                "mapping from the source account's objectGUID; the target's is created by Windows at first logon".into(),
-            ],
-        });
-    }
-
-    for (label, mount) in [("NTUSER.DAT", "ntuser"), ("UsrClass.dat", "usrclass")] {
-        let Some(probe) = facts.hive_files.iter().find(|h| h.label == label) else {
-            continue;
-        };
-        if probe.state == crate::model::LockState::Missing {
-            continue;
-        }
-        plan.push(PlannedChange {
-            area: Area::Hive,
-            op: Op::Modify,
-            target: probe.path.display().to_string(),
-            lines: vec![
-                format!("mount at HKU\\{HIVE_MOUNT_PREFIX}{mount} (SeRestorePrivilege)"),
-                format!(
-                    "replace {source_sid} with {target_sid} in every key owner and explicit ACE"
-                ),
-                "unload and verify the file is no longer held".into(),
-            ],
-        });
-    }
-
+    let mut plan = vec![copy_step(facts, &source, &staging)];
     if let Some(scan) = &facts.scan {
-        let root = facts
-            .profile_dir
-            .as_ref()
-            .map(|d| d.path.display().to_string())
-            .unwrap_or_default();
-        let mut lines = vec![
-            format!(
-                "owner {source_sid} -> {target_sid} on {} entries",
-                scan.owned_by_source.count
-            ),
-            format!(
-                "explicit ACEs {source_sid} -> {target_sid} on {} entries ({} with protected DACLs)",
-                scan.explicit_source_aces.count, scan.protected_dacls_with_source.count
-            ),
-            "SYSTEM, Administrators and inherited ACEs are left unchanged".into(),
-        ];
-        lines.extend(
-            scan.explicit_source_aces
-                .samples
-                .iter()
-                .map(|s| format!("e.g. {s}")),
-        );
-        plan.push(PlannedChange {
-            area: Area::FileSystem,
-            op: Op::Modify,
-            target: root,
-            lines,
-        });
-        if scan.reparse_points.count + scan.cloud_placeholders.count > 0 {
+        if scan.reparse_points.count > 0 {
             let mut lines = vec![format!(
-                "{} junctions/symlinks and {} cloud placeholders are not traversed or modified",
-                scan.reparse_points.count, scan.cloud_placeholders.count
+                "{} junctions/symlinks are recreated, retargeted from {source} to {target}",
+                scan.reparse_points.count
             )];
             lines.extend(scan.reparse_points.samples.iter().cloned());
             plan.push(PlannedChange {
-                area: Area::FileSystem,
-                op: Op::Skip,
-                target: "reparse points".into(),
+                area: Area::Copy,
+                op: Op::Create,
+                target: "junctions".into(),
                 lines,
+            });
+        }
+        if scan.cloud_placeholders.count > 0 {
+            plan.push(PlannedChange {
+                area: Area::Copy,
+                op: Op::Skip,
+                target: "cloud placeholders".into(),
+                lines: vec![format!(
+                    "{} online-only files are not copied (copying would download them)",
+                    scan.cloud_placeholders.count
+                )],
             });
         }
     }
 
+    plan.push(hive_step(facts, source_sid, target_sid, &source, &target));
+    if let Some(scan) = &facts.scan {
+        plan.push(PlannedChange {
+            area: Area::Rewrite,
+            op: Op::Modify,
+            target: format!("{staging} (file security)"),
+            lines: vec![
+                format!(
+                    "owner {source_sid} -> {target_sid} on {} entries",
+                    scan.owned_by_source.count
+                ),
+                format!(
+                    "explicit ACEs {source_sid} -> {target_sid} on {} entries ({} with protected DACLs)",
+                    scan.explicit_source_aces.count, scan.protected_dacls_with_source.count
+                ),
+                "SYSTEM, Administrators and inherited ACEs are left as they are".into(),
+            ],
+        });
+    }
+    plan.push(PlannedChange {
+        area: Area::Verify,
+        op: Op::Check,
+        target: staging.clone(),
+        lines: vec![
+            "same number of folders and files, same sizes as the source".into(),
+            "both hive copies load, and no key owner or ACE still names the source SID".into(),
+            "no file owner or explicit ACE still names the source SID".into(),
+            "any failure stops here: the copy is deleted and nothing outside it has changed".into(),
+        ],
+    });
+    plan.push(commit_step(entry, dir, source_sid, target_sid, &staging));
+    plan.push(PlannedChange {
+        area: Area::Unchanged,
+        op: Op::Skip,
+        target: source.clone(),
+        lines: vec![
+            format!("the source folder and HKLM\\{PROFILE_LIST_KEY}\\{source_sid} are not modified"),
+            "rollback until finalize: delete the target entry and folder; the source account logs on as before".into(),
+        ],
+    });
     plan.extend(follow_ups(facts));
     plan
 }
 
-fn target_entry(entry: &ProfileListEntry, source_sid: &str, target_sid: &str) -> PlannedChange {
-    let mut lines = vec![format!(
-        "+ {MIGRATION_MARKER_VALUE:<18} REG_SZ         {source_sid}   (in-progress marker, removed on success)"
-    )];
-    if let Some(path) = &entry.profile_image_path {
+fn copy_step(facts: &SystemFacts, source: &str, staging: &str) -> PlannedChange {
+    let mut lines = vec![format!("from {source} (read-only, never modified)")];
+    if let Some(scan) = &facts.scan {
         lines.push(format!(
-            "+ {:<18} REG_EXPAND_SZ  {path}",
-            "ProfileImagePath"
+            "{} folders, {} files, {}",
+            scan.directories,
+            scan.files,
+            format_bytes(scan.file_bytes)
         ));
     }
-    lines.push(format!(
-        "+ {:<18} REG_DWORD      0x{:08X}   (copied)",
-        "Flags",
-        entry.flags.unwrap_or(0)
-    ));
-    lines.push(format!(
-        "+ {:<18} REG_DWORD      0x00000000   (reset; source was 0x{:08X})",
-        "State",
-        entry.state.unwrap_or(0)
-    ));
-    lines.push(format!(
-        "+ {:<18} REG_BINARY     <binary {target_sid}>",
-        "Sid"
-    ));
-    lines.push("  not copied: RefCount, Guid, ProfileLoadTime*/ProfileUnloadTime*".into());
+    lines.push(
+        "with backup semantics: attributes, timestamps and security descriptors are kept".into(),
+    );
     PlannedChange {
-        area: Area::Registry,
+        area: Area::Copy,
+        op: Op::Create,
+        target: staging.to_string(),
+        lines,
+    }
+}
+
+fn hive_step(
+    facts: &SystemFacts,
+    source_sid: &str,
+    target_sid: &str,
+    source: &str,
+    target: &str,
+) -> PlannedChange {
+    let mut lines = vec![
+        "NTUSER.DAT and UsrClass.dat are rewritten in the copy; the originals are never loaded"
+            .into(),
+        format!("{source_sid} -> {target_sid} in every key owner and explicit ACE"),
+    ];
+    match &facts.registry {
+        Some(Ok(inspection)) => {
+            lines.push(format!(
+                "{} text values: {source} -> {target}",
+                inspection.text_path_refs.len()
+            ));
+            if !inspection.binary_path_refs.is_empty() {
+                lines.push(format!(
+                    "{} binary values that embed {source} are reported, not rewritten",
+                    inspection.binary_path_refs.len()
+                ));
+            }
+        }
+        _ => lines.push(format!(
+            "text values containing {source} -> {target} (not counted: registry not inspected)"
+        )),
+    }
+    PlannedChange {
+        area: Area::Rewrite,
+        op: Op::Modify,
+        target: "registry hives (copies)".into(),
+        lines,
+    }
+}
+
+fn commit_step(
+    entry: &ProfileListEntry,
+    dir: &TargetDirFacts,
+    source_sid: &str,
+    target_sid: &str,
+    staging: &str,
+) -> PlannedChange {
+    let target = dir.path.display().to_string();
+    // Keep the source entry's unexpanded form (%SystemDrive%\Users\...) so
+    // the new entry looks exactly like one the profile service writes.
+    let image_path = entry
+        .profile_image_path
+        .as_deref()
+        .and_then(|p| p.rsplit_once('\\'))
+        .map(|(parent, _)| format!("{parent}\\{}", dir.folder_name))
+        .unwrap_or_else(|| target.clone());
+    PlannedChange {
+        area: Area::Commit,
         op: Op::Create,
         target: format!("HKLM\\{PROFILE_LIST_KEY}\\{target_sid}"),
-        lines,
+        lines: vec![
+            format!("rename {staging} -> {target}"),
+            format!("+ {MIGRATION_MARKER_VALUE:<18} REG_SZ         {source_sid}   (in-progress marker, removed on success)"),
+            format!("+ {:<18} REG_EXPAND_SZ  {image_path}", "ProfileImagePath"),
+            format!(
+                "+ {:<18} REG_DWORD      0x{:08X}   (copied)",
+                "Flags",
+                entry.flags.unwrap_or(0)
+            ),
+            format!(
+                "+ {:<18} REG_DWORD      0x00000000   (reset; source was 0x{:08X})",
+                "State",
+                entry.state.unwrap_or(0)
+            ),
+            format!("+ {:<18} REG_BINARY     <binary {target_sid}>", "Sid"),
+            "  not set: RefCount, Guid (Windows adds them at the target's first logon)".into(),
+        ],
     }
 }
 
 fn follow_ups(facts: &SystemFacts) -> Vec<PlannedChange> {
     let mut items = Vec::new();
-    let mut manual = |target: &str, line: String| {
+    let mut manual = |target: &str, lines: Vec<String>| {
         items.push(PlannedChange {
             area: Area::FollowUp,
             op: Op::Manual,
             target: target.into(),
-            lines: vec![line],
+            lines,
         });
     };
     if let Some(known) = &facts.known_paths {
         if known.dpapi_master_keys || known.credential_files > 0 {
             manual(
-                "DPAPI",
-                "re-enter saved credentials/browser passwords as the target; they cannot be re-keyed offline".into(),
+                "saved credentials",
+                vec!["re-enter saved Windows credentials as the target; they cannot be re-keyed offline (the source profile keeps them)".into()],
             );
         }
-        if !known.onedrive_folders.is_empty() || known.onedrive_client_state {
-            manual(
-                "OneDrive",
-                "unlink before migration, sign in as the target afterwards".into(),
-            );
+    }
+    for app in facts.apps.iter().filter(|a| !a.actions.is_empty()) {
+        manual(app.name, app.actions.clone());
+    }
+    if let Some(groups) = &facts.local_groups {
+        if let (Ok(source), Ok(target)) = (&groups.source, &groups.target) {
+            let missing: Vec<String> = source
+                .iter()
+                .filter(|g| !target.iter().any(|t| t.eq_ignore_ascii_case(g)))
+                .map(|g| format!("add the target to {g}"))
+                .collect();
+            if !missing.is_empty() {
+                manual("local groups", missing);
+            }
+        }
+    }
+    if let Some(refs) = &facts.account_references {
+        let mut lines: Vec<String> = refs
+            .services
+            .iter()
+            .map(|s| format!("service {s}"))
+            .collect();
+        lines.extend(
+            refs.scheduled_tasks
+                .iter()
+                .map(|t| format!("scheduled task {t}")),
+        );
+        if !lines.is_empty() {
+            manual("run-as account", lines);
         }
     }
     if facts.appx_store_present
@@ -231,13 +314,16 @@ fn follow_ups(facts: &SystemFacts) -> Vec<PlannedChange> {
     {
         manual(
             "AppX",
-            "after first logon, verify Start/Settings; re-register packages if broken".into(),
+            vec!["after first logon, verify Start/Settings; re-register packages if broken".into()],
         );
     }
     if facts.scan.as_ref().is_some_and(|s| s.encrypted.count > 0) {
         manual(
             "EFS",
-            "decrypt EFS files as the source user before migrating, or accept their loss".into(),
+            vec![
+                "decrypt EFS files as the source user before migrating, or accept their loss"
+                    .into(),
+            ],
         );
     }
     items
@@ -259,13 +345,14 @@ pub fn render(plan: &[PlannedChange]) -> String {
             out.push('\n');
         }
     }
-    out.push_str("\nlegend: + create  - remove  ~ modify  = skip  ! manual follow-up\n");
+    out.push_str("\nlegend: + create  ~ modify  ? verify  = unchanged/skip  ! manual follow-up\n");
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apps::AppReport;
     use crate::model::*;
     use std::path::PathBuf;
 
@@ -316,18 +403,7 @@ mod tests {
                 }],
             },
             loaded_hives: vec![],
-            hive_files: vec![
-                HiveFileProbe {
-                    label: "NTUSER.DAT",
-                    path: PathBuf::from(r"C:\Users\jdoe\NTUSER.DAT"),
-                    state: LockState::Unlocked,
-                },
-                HiveFileProbe {
-                    label: "UsrClass.dat",
-                    path: PathBuf::from("UsrClass.dat"),
-                    state: LockState::Missing,
-                },
-            ],
+            hive_files: vec![],
             appx_store_present: true,
             profile_dir: Some(ProfileDirFacts {
                 path: PathBuf::from(r"C:\Users\jdoe"),
@@ -336,61 +412,117 @@ mod tests {
             }),
             known_paths: Some(KnownPaths::default()),
             scan: Some(ProfileScan {
+                directories: 2,
+                files: 3,
+                file_bytes: 2048,
                 reparse_points: Tally {
                     count: 1,
                     samples: vec![r"C:\Users\jdoe\Application Data".into()],
                 },
                 ..ProfileScan::default()
             }),
+            target_dir: Some(TargetDirFacts {
+                folder_name: "jdoe.corp".into(),
+                path: PathBuf::from(r"C:\Users\jdoe.corp"),
+                exists: false,
+                staging_path: PathBuf::from(format!(r"C:\Users\jdoe.corp{STAGING_SUFFIX}")),
+                staging_exists: false,
+            }),
+            free_bytes: Some(Ok(1 << 40)),
+            registry: Some(Ok(RegistryInspection {
+                text_path_refs: vec!["a".into(), "b".into()],
+                binary_path_refs: vec!["c".into()],
+                ..RegistryInspection::default()
+            })),
+            local_groups: Some(LocalGroups {
+                source: Ok(vec!["Administrators".into(), "Users".into()]),
+                target: Ok(vec!["Users".into()]),
+            }),
+            account_references: Some(AccountReferences::default()),
+            apps: vec![AppReport {
+                id: "APP_TEAMS",
+                name: "Microsoft Teams",
+                carried: vec![],
+                actions: vec!["sign in to Teams again as the target".into()],
+            }],
         }
     }
 
+    fn step(plan: &[PlannedChange], area: Area) -> &PlannedChange {
+        plan.iter()
+            .find(|c| c.area == area)
+            .unwrap_or_else(|| panic!("no {area:?} step"))
+    }
+
     #[test]
-    fn plan_creates_target_and_removes_source_entry() {
+    fn plan_copies_into_staging_then_commits_to_the_new_folder() {
         let plan = build(&facts());
-        assert_eq!(plan[0].op, Op::Create);
-        assert!(plan[0].target.ends_with(TGT));
-        assert!(plan[0]
+        let copy = &plan[0];
+        assert_eq!((copy.area, copy.op), (Area::Copy, Op::Create));
+        assert!(copy.target.ends_with(STAGING_SUFFIX));
+        assert!(copy.lines.iter().any(|l| l == "2 folders, 3 files, 2.0 KB"));
+
+        let commit = step(&plan, Area::Commit);
+        assert!(commit.target.ends_with(TGT));
+        assert!(commit
             .lines
             .iter()
-            .any(|l| l.contains(r"%SystemDrive%\Users\jdoe")));
-        assert!(plan[0]
+            .any(|l| l.contains(r"%SystemDrive%\Users\jdoe.corp")));
+        assert!(commit
             .lines
             .iter()
             .any(|l| l.contains("reset; source was 0x00000100")));
-        assert_eq!(plan[1].op, Op::Remove);
-        assert!(plan[1].target.ends_with(SRC));
     }
 
     #[test]
-    fn plan_drops_profile_guid_mapping_when_present() {
+    fn source_profile_is_declared_unchanged() {
         let plan = build(&facts());
-        assert!(plan
+        let unchanged = step(&plan, Area::Unchanged);
+        assert_eq!(unchanged.target, r"C:\Users\jdoe");
+        assert!(unchanged.lines[0].contains(SRC));
+        assert!(!plan.iter().any(|c| c.target.contains("ProfileGuid")));
+    }
+
+    #[test]
+    fn verification_comes_before_commit() {
+        let plan = build(&facts());
+        let position = |area| plan.iter().position(|c| c.area == area).unwrap();
+        assert!(position(Area::Rewrite) < position(Area::Verify));
+        assert!(position(Area::Verify) < position(Area::Commit));
+    }
+
+    #[test]
+    fn registry_counts_and_binary_caveat_are_shown() {
+        let plan = build(&facts());
+        let hive = plan
             .iter()
-            .any(|c| c.op == Op::Remove && c.target.ends_with("{0f2a-guid}")));
-    }
-
-    #[test]
-    fn missing_hive_file_is_not_planned() {
-        let plan = build(&facts());
-        let hives: Vec<_> = plan.iter().filter(|c| c.area == Area::Hive).collect();
-        assert_eq!(hives.len(), 1);
-        assert!(hives[0].target.ends_with("NTUSER.DAT"));
-    }
-
-    #[test]
-    fn reparse_points_are_listed_as_skipped() {
-        let plan = build(&facts());
-        let skip = plan.iter().find(|c| c.op == Op::Skip).unwrap();
-        assert!(skip.lines.iter().any(|l| l.contains("Application Data")));
-    }
-
-    #[test]
-    fn appx_follow_up_is_included() {
-        let plan = build(&facts());
-        assert!(plan
+            .find(|c| c.target == "registry hives (copies)")
+            .unwrap();
+        assert!(hive.lines.iter().any(|l| l.starts_with("2 text values")));
+        assert!(hive
+            .lines
             .iter()
-            .any(|c| c.area == Area::FollowUp && c.target == "AppX"));
+            .any(|l| l.contains("reported, not rewritten")));
+    }
+
+    #[test]
+    fn junctions_are_recreated_for_the_new_folder() {
+        let plan = build(&facts());
+        let junctions = plan.iter().find(|c| c.target == "junctions").unwrap();
+        assert!(junctions.lines[0].contains(r"to C:\Users\jdoe.corp"));
+    }
+
+    #[test]
+    fn follow_ups_include_apps_and_missing_groups() {
+        let plan = build(&facts());
+        let follow: Vec<&str> = plan
+            .iter()
+            .filter(|c| c.area == Area::FollowUp)
+            .map(|c| c.target.as_str())
+            .collect();
+        assert!(follow.contains(&"Microsoft Teams"));
+        assert!(follow.contains(&"local groups"));
+        assert!(follow.contains(&"AppX"));
     }
 
     #[test]
@@ -406,6 +538,6 @@ mod tests {
     fn render_marks_dry_run() {
         let text = render(&build(&facts()));
         assert!(text.starts_with("DRY RUN"));
-        assert!(text.contains(&format!("[registry] + HKLM\\{PROFILE_LIST_KEY}\\{TGT}")));
+        assert!(text.contains(&format!("[commit] + HKLM\\{PROFILE_LIST_KEY}\\{TGT}")));
     }
 }

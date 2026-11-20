@@ -1,11 +1,12 @@
 //! Machine identity: computer name, domain membership, OS version.
 
 use std::io;
-use std::ptr::null;
+use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::NetworkManagement::NetManagement::{
-    NetApiBufferFree, NetGetJoinInformation, NetSetupDomainName, NetSetupUnjoined,
-    NetSetupWorkgroupName, NETSETUP_JOIN_STATUS,
+    NERR_Success, NetApiBufferFree, NetGetJoinInformation, NetSetupDomainName, NetSetupUnjoined,
+    NetSetupWorkgroupName, NetUserGetLocalGroups, LG_INCLUDE_INDIRECT, LOCALGROUP_USERS_INFO_0,
+    MAX_PREFERRED_LENGTH, NETSETUP_JOIN_STATUS,
 };
 use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
@@ -27,6 +28,55 @@ pub fn computer_name() -> io::Result<String> {
         return Err(last_error("GetComputerNameExW"));
     }
     Ok(from_wide_buf(&buf[..len as usize]))
+}
+
+/// Local groups of this machine that `account` (`DOMAIN\user`) belongs to,
+/// including through domain groups (LG_INCLUDE_INDIRECT). For a domain
+/// account this asks a domain controller, so it fails when none is reachable.
+pub fn local_groups(account: &str) -> io::Result<Vec<String>> {
+    let wide = to_wide(account);
+    let mut buffer: *mut u8 = null_mut();
+    let mut read = 0u32;
+    let mut total = 0u32;
+    // SAFETY: null server = local machine; NUL-terminated name; out-pointers
+    // are valid. The buffer is released below on every path.
+    let status = unsafe {
+        NetUserGetLocalGroups(
+            null(),
+            wide.as_ptr(),
+            0,
+            LG_INCLUDE_INDIRECT,
+            &mut buffer,
+            MAX_PREFERRED_LENGTH,
+            &mut read,
+            &mut total,
+        )
+    };
+    let groups = if status == NERR_Success && !buffer.is_null() {
+        // SAFETY: on success the buffer holds `read` LOCALGROUP_USERS_INFO_0
+        // entries whose names are NUL-terminated strings inside the buffer.
+        let entries = unsafe {
+            std::slice::from_raw_parts(buffer as *const LOCALGROUP_USERS_INFO_0, read as usize)
+        };
+        entries
+            .iter()
+            // SAFETY: see above; the buffer is still alive here.
+            .map(|entry| unsafe { from_wide_ptr(entry.lgrui0_name) })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !buffer.is_null() {
+        // SAFETY: frees the buffer allocated by NetUserGetLocalGroups once.
+        unsafe { NetApiBufferFree(buffer as *const _) };
+    }
+    if status != NERR_Success {
+        return Err(win32_error(
+            &format!("NetUserGetLocalGroups({account})"),
+            status,
+        ));
+    }
+    Ok(groups)
 }
 
 pub fn domain_membership() -> DomainMembership {

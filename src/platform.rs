@@ -7,8 +7,9 @@
 #[cfg(windows)]
 pub use crate::win::{
     computer_name, create_private_dir, current_token, domain_membership, export_registry_key,
-    file_attributes, hklm_key_exists, loaded_user_hives, lookup_account_name, lookup_account_sid,
-    os_version, probe_exclusive, read_profile_list, read_sddl,
+    file_attributes, free_bytes, hklm_key_exists, loaded_user_hives, local_groups,
+    lookup_account_name, lookup_account_sid, os_version, probe_exclusive, read_profile_list,
+    read_sddl, service_accounts, walk_hive_file, walk_loaded_hive,
 };
 
 #[cfg(not(windows))]
@@ -21,7 +22,8 @@ mod unsupported {
     use std::path::Path;
 
     use crate::model::{
-        DomainMembership, LockState, LookupOutcome, OsVersion, ProfileListSnapshot, TokenInfo,
+        DomainMembership, LockState, LookupOutcome, OsVersion, ProfileListSnapshot, RegData,
+        TokenInfo,
     };
     use crate::scan::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT};
 
@@ -80,6 +82,32 @@ mod unsupported {
     }
 
     pub fn create_private_dir(_path: &Path) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub fn free_bytes(_path: &Path) -> io::Result<u64> {
+        Err(unsupported())
+    }
+
+    pub fn local_groups(_account: &str) -> io::Result<Vec<String>> {
+        Err(unsupported())
+    }
+
+    pub fn service_accounts() -> io::Result<Vec<(String, String)>> {
+        Err(unsupported())
+    }
+
+    pub fn walk_loaded_hive(
+        _hku_subkey: &str,
+        _visit: &mut dyn FnMut(&str, &str, &RegData),
+    ) -> io::Result<Vec<String>> {
+        Err(unsupported())
+    }
+
+    pub fn walk_hive_file(
+        _path: &Path,
+        _visit: &mut dyn FnMut(&str, &str, &RegData),
+    ) -> io::Result<Vec<String>> {
         Err(unsupported())
     }
 

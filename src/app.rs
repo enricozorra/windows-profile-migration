@@ -73,6 +73,7 @@ fn run_logged(args: &Args, log: &mut Logger) -> Result<i32, Box<dyn Error>> {
     let facts = facts::gather(&Request {
         source: args.source.clone(),
         target: args.target.clone(),
+        work_dir: base_dir()?.join("work"),
     })?;
     log_facts(&facts, log)?;
 
@@ -215,6 +216,67 @@ fn log_facts(facts: &SystemFacts, log: &mut Logger) -> Result<(), Box<dyn Error>
             ("loaded_hives", Json::strings(&facts.loaded_hives)),
         ],
     )?;
+    match &facts.registry {
+        Some(Ok(inspection)) => {
+            log.event(
+                Level::Info,
+                "preflight",
+                "registry_inspected",
+                "source registry inspected",
+                vec![
+                    ("method", inspection.method.as_str().into()),
+                    ("values", inspection.values_scanned.into()),
+                    ("network_drives", Json::strings(&inspection.network_drives)),
+                    ("printers", Json::strings(&inspection.printer_connections)),
+                    (
+                        "outlook_profiles",
+                        Json::strings(&inspection.outlook_profiles),
+                    ),
+                    (
+                        "outlook_data_files",
+                        Json::strings(&inspection.outlook_data_files),
+                    ),
+                    (
+                        "onedrive_accounts",
+                        Json::strings(&inspection.onedrive_accounts),
+                    ),
+                ],
+            )?;
+            // One record per reference, so the log is the complete list the
+            // console only samples.
+            for (kind, refs) in [
+                ("text", &inspection.text_path_refs),
+                ("binary", &inspection.binary_path_refs),
+            ] {
+                for location in refs {
+                    log.event(
+                        Level::Info,
+                        "preflight",
+                        "registry_path_ref",
+                        location,
+                        vec![("kind", kind.into())],
+                    )?;
+                }
+            }
+            for error in &inspection.errors {
+                log.event(
+                    Level::Warn,
+                    "preflight",
+                    "registry_unreadable",
+                    error,
+                    vec![],
+                )?;
+            }
+        }
+        Some(Err(reason)) => log.event(
+            Level::Warn,
+            "preflight",
+            "registry_unreadable",
+            reason,
+            vec![],
+        )?,
+        None => {}
+    }
     if let Some(scan) = &facts.scan {
         for skipped in &scan.skipped {
             let (level, reason) = match &skipped.reason {

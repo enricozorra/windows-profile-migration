@@ -5,17 +5,20 @@ use std::ffi::c_void;
 use std::io;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE, LUID};
+use windows_sys::Win32::Foundation::{
+    GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED, HANDLE, LUID,
+};
 use windows_sys::Win32::Security::{
-    CheckTokenMembership, CreateWellKnownSid, GetTokenInformation, LookupPrivilegeNameW,
-    TokenElevation, TokenPrivileges, TokenUser, WinBuiltinAdministratorsSid, LUID_AND_ATTRIBUTES,
-    SECURITY_MAX_SID_SIZE, TOKEN_ELEVATION, TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES, TOKEN_QUERY,
-    TOKEN_USER,
+    AdjustTokenPrivileges, CheckTokenMembership, CreateWellKnownSid, GetTokenInformation,
+    LookupPrivilegeNameW, LookupPrivilegeValueW, TokenElevation, TokenPrivileges, TokenUser,
+    WinBuiltinAdministratorsSid, LUID_AND_ATTRIBUTES, SECURITY_MAX_SID_SIZE, SE_PRIVILEGE_ENABLED,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_INFORMATION_CLASS, TOKEN_PRIVILEGES,
+    TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use super::account::sid_to_string;
-use super::wide::{aligned_buffer, from_wide_buf, last_error, OwnedHandle};
+use super::wide::{aligned_buffer, from_wide_buf, last_error, to_wide, OwnedHandle};
 use crate::model::TokenInfo;
 
 pub fn current_token() -> io::Result<TokenInfo> {
@@ -62,6 +65,56 @@ pub fn current_token() -> io::Result<TokenInfo> {
 /// Membership in BUILTIN\Administrators as an *enabled* group. Under UAC
 /// the filtered token has it deny-only, which CheckTokenMembership reports
 /// as not a member, so this is false in a non-elevated admin shell.
+/// Switches on a privilege this process's token already holds (held
+/// privileges such as SeRestorePrivilege start disabled).
+pub fn enable_privilege(name: &str) -> io::Result<()> {
+    let mut raw: HANDLE = null_mut();
+    // SAFETY: pseudo-handle for the current process; valid out-pointer.
+    let ok = unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut raw,
+        )
+    };
+    if ok == 0 {
+        return Err(last_error("OpenProcessToken"));
+    }
+    let token = OwnedHandle(raw);
+    let wide = to_wide(name);
+    let mut luid = LUID {
+        LowPart: 0,
+        HighPart: 0,
+    };
+    // SAFETY: NUL-terminated name, null system = local, valid out-pointer.
+    if unsafe { LookupPrivilegeValueW(null(), wide.as_ptr(), &mut luid) } == 0 {
+        return Err(last_error(&format!("LookupPrivilegeValueW({name})")));
+    }
+    let state = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    // SAFETY: valid token opened with TOKEN_ADJUST_PRIVILEGES; the previous
+    // state is not requested.
+    let ok = unsafe { AdjustTokenPrivileges(token.0, 0, &state, 0, null_mut(), null_mut()) };
+    if ok == 0 {
+        return Err(last_error(&format!("AdjustTokenPrivileges({name})")));
+    }
+    // AdjustTokenPrivileges reports success even when the token does not
+    // hold the privilege; only the last error tells.
+    // SAFETY: reads the calling thread's last-error value.
+    if unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{name} is not held by this process"),
+        ));
+    }
+    Ok(())
+}
+
 fn is_admin_member() -> io::Result<bool> {
     let mut sid_buf = aligned_buffer(SECURITY_MAX_SID_SIZE);
     let mut size = SECURITY_MAX_SID_SIZE;

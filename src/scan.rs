@@ -115,6 +115,7 @@ pub fn scan_profile(
                         pending.push(path);
                     } else {
                         scan.files += 1;
+                        scan.file_bytes += metadata.len();
                     }
                 }
             }
@@ -280,11 +281,12 @@ mod tests {
         let tree = TempTree::new("counts");
         fs::create_dir_all(tree.0.join("Documents/Sub")).unwrap();
         fs::write(tree.0.join("Documents/a.txt"), b"a").unwrap();
-        fs::write(tree.0.join("Documents/Sub/b.txt"), b"b").unwrap();
+        fs::write(tree.0.join("Documents/Sub/b.txt"), b"bcd").unwrap();
 
         let scan = scan_profile(&tree.0, SRC, &mut owner_sddl);
         assert_eq!(scan.directories, 3);
         assert_eq!(scan.files, 2);
+        assert_eq!(scan.file_bytes, 4);
         assert_eq!(scan.owned_by_source.count, 5);
         assert_eq!(scan.explicit_source_aces.count, 5);
         assert_eq!(scan.protected_dacls_with_source.count, 5);
